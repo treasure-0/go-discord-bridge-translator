@@ -83,7 +83,7 @@ func main() {
 	if err := dg.Open(); err != nil {
 		log.Fatalf("Failed to open Discord connection: %v", err)
 	}
-	log.Println("🚀 Bridge Translator is live! Webhook mirroring enabled.")
+	log.Println("Bridge Translator is live! Webhook mirroring enabled.")
 
 	// Keep the application running until a termination signal is received.
 	<-ctx.Done()
@@ -120,7 +120,7 @@ func (b *Bot) handleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 		SafetySettings: b.safety,
 	})
 	if err != nil {
-		log.Printf("❌ Gemini Error: %v", err)
+		log.Printf("Gemini Error: %v", err)
 		return
 	}
 
