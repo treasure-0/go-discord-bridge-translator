@@ -33,6 +33,8 @@ type Config struct {
 
 	AlertUserID    string
 	AlertChannelID string
+	ReportTime     string // daily report, "09:00"
+	ReportTZ       string
 	DataDir        string
 }
 
@@ -52,6 +54,8 @@ func loadConfig() Config {
 		QuotaWarnPct:   envInt("QUOTA_ALERT_PERCENT", 15),
 		AlertUserID:    os.Getenv("ALERT_USER_ID"),
 		AlertChannelID: os.Getenv("ALERT_CHANNEL_ID"),
+		ReportTime:     envOr("REPORT_TIME", "09:00"),
+		ReportTZ:       envOr("REPORT_TZ", "Europe/Berlin"),
 		DataDir:        envOr("DATA_DIR", "data"),
 	}
 	if cfg.DiscordToken == "" || cfg.ChannelRU == "" || cfg.ChannelINT == "" {
@@ -91,10 +95,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("store: %v", err)
 	}
-	usage, err := OpenUsageCounter(filepath.Join(cfg.DataDir, "usage.json"))
+	ops, err = OpenOps(filepath.Join(cfg.DataDir, "ops.json"))
 	if err != nil {
-		log.Fatalf("usage counter: %v", err)
+		log.Fatalf("ops journal: %v", err)
 	}
+	crashed := ops.Start(time.Now(), serverBootTime())
+	_ = ops.Flush()
 
 	dg, err := discordgo.New("Bot " + cfg.DiscordToken)
 	if err != nil {
@@ -109,11 +115,12 @@ func main() {
 	// Providers without an API key are skipped.
 	var chain []Translator
 	var quotas []QuotaReporter
+	var names []string
 	for _, name := range cfg.Translators {
 		switch name {
 		case "azure":
 			if cfg.AzureKey != "" {
-				a := NewAzure(cfg.AzureKey, cfg.AzureRegion, cfg.AzureLimit, usage)
+				a := NewAzure(cfg.AzureKey, cfg.AzureRegion, cfg.AzureLimit)
 				chain = append(chain, a)
 				quotas = append(quotas, a)
 			}
@@ -135,6 +142,9 @@ func main() {
 			log.Fatalf("config: unknown translator %q in TRANSLATORS", name)
 		}
 	}
+	for _, t := range chain {
+		names = append(names, t.Name())
+	}
 	if len(chain) == 0 {
 		log.Fatal("config: no translator is configured (set an API key for at least one of TRANSLATORS)")
 	}
@@ -151,14 +161,28 @@ func main() {
 	})
 	bridge.notifier = notifier
 	bridge.Register()
+	dg.AddHandler(func(_ *discordgo.Session, _ *discordgo.Disconnect) {
+		ops.Record(EvDisconnect, "Потеряно соединение с Discord (бот переподключается автоматически)")
+	})
 
 	if err := dg.Open(); err != nil {
 		log.Fatalf("discord connect: %v", err)
 	}
 	log.Printf("bridge is live (translators: %s)", translator.Name())
-	notifier.Alert("startup", 10*time.Minute, "✅ Бот-переводчик запущен. Переводчики по порядку: "+translator.Name())
+	if crashed {
+		notifier.Alert("startup", 10*time.Minute, "⚠️ Бот восстановился после аварийной остановки. Переводчики: "+translator.Name())
+	} else {
+		notifier.Alert("startup", 10*time.Minute, "✅ Бот-переводчик запущен. Переводчики по порядку: "+translator.Name())
+	}
 
 	go notifier.WatchQuotas(ctx, quotas, cfg.QuotaWarnPct, 30*time.Minute)
+	if notifier.Enabled() {
+		rep, err := NewReporter(notifier, ops, quotas, names, cfg.ReportTZ, cfg.ReportTime)
+		if err != nil {
+			log.Fatalf("config: %v", err)
+		}
+		go rep.Run(ctx)
+	}
 
 	// Persist state periodically.
 	go func() {
@@ -172,8 +196,9 @@ func main() {
 				if err := store.Flush(); err != nil {
 					log.Printf("store flush: %v", err)
 				}
-				if err := usage.Flush(); err != nil {
-					log.Printf("usage flush: %v", err)
+				ops.Heartbeat(time.Now())
+				if err := ops.Flush(); err != nil {
+					log.Printf("ops flush: %v", err)
 				}
 			}
 		}
@@ -184,5 +209,6 @@ func main() {
 	bridge.Close()
 	_ = dg.Close()
 	_ = store.Flush()
-	_ = usage.Flush()
+	ops.Stop()
+	_ = ops.Flush()
 }

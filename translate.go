@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"google.golang.org/genai"
 )
@@ -158,7 +159,10 @@ func NewGemini(ctx context.Context, apiKey, model string) (*Gemini, error) {
 	return &Gemini{client: c, model: model}, nil
 }
 
-func (g *Gemini) Name() string { return "gemini(" + g.model + ")" }
+func (g *Gemini) Name() string { return "gemini" }
+
+// Label includes the model, for logs.
+func (g *Gemini) Label() string { return "gemini(" + g.model + ")" }
 
 func (g *Gemini) Translate(ctx context.Context, text, hint string, to Lang) (string, error) {
 	m := mask(text)
@@ -195,6 +199,9 @@ func (g *Gemini) Translate(ctx context.Context, text, hint string, to Lang) (str
 			return "", &limitError{msg: err.Error(), cooldown: 30 * time.Second}
 		}
 		return "", err
+	}
+	if resp.UsageMetadata != nil {
+		ops.Add(g.Name(), "tokens", int64(resp.UsageMetadata.TotalTokenCount))
 	}
 	out := strings.TrimSpace(resp.Text())
 	if out == "" {
@@ -333,6 +340,9 @@ func (f *Fallback) Name() string {
 	names := make([]string, len(f.chain))
 	for i, t := range f.chain {
 		names[i] = t.Name()
+		if l, ok := t.(interface{ Label() string }); ok {
+			names[i] = l.Label()
+		}
 	}
 	return strings.Join(names, " -> ")
 }
@@ -358,8 +368,12 @@ func (f *Fallback) TranslateNamed(ctx context.Context, text, hint string, to Lan
 		out, err := t.Translate(cctx, text, hint, to)
 		cancel()
 		if err == nil {
+			ops.Add(t.Name(), "requests", 1)
+			ops.Add(t.Name(), "chars", int64(utf8.RuneCountInString(text)))
 			return out, t.Name(), nil
 		}
+		ops.Add(t.Name(), "errors", 1)
+		recordError("%s: %v", t.Name(), err)
 		if errors.Is(err, errRateLimited) {
 			cd := f.cooldown
 			var le *limitError

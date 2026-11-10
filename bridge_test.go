@@ -214,23 +214,74 @@ func TestFallbackUsesProviderCooldown(t *testing.T) {
 	}
 }
 
-func TestUsageCounterAndHumanInt(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "u.json")
-	c, _ := OpenUsageCounter(path)
-	c.Add("azure", 1500)
-	c.Add("azure", 500)
-	if err := c.Flush(); err != nil {
-		t.Fatal(err)
-	}
-	c2, err := OpenUsageCounter(path)
-	if err != nil || c2.ThisMonth("azure") != 2000 {
-		t.Fatalf("reload: %v %d", err, c2.ThisMonth("azure"))
-	}
+func TestHumanIntAndNilNotifier(t *testing.T) {
 	if got := humanInt(2000000); got != "2 000 000" {
 		t.Fatalf("humanInt: %q", got)
 	}
 	var n *Notifier
 	n.Alert("x", time.Minute, "nil notifier must be a no-op")
+}
+
+func TestOpsCrashRebootAndUsage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ops.json")
+	o, _ := OpenOps(path)
+	boot := time.Now().Add(-48 * time.Hour)
+	if o.Start(time.Now(), boot) {
+		t.Fatal("first start is not a crash")
+	}
+	o.Add("azure", "chars", 1500)
+	o.Add("azure", "chars", 500)
+	o.Flush() // process dies here without Stop()
+
+	o2, _ := OpenOps(path)
+	if !o2.Start(time.Now(), boot.Add(time.Hour)) { // and the server rebooted
+		t.Fatal("expected crash to be detected")
+	}
+	kinds := map[string]bool{}
+	for _, e := range o2.EventsBetween(time.Now().Add(-72*time.Hour), time.Now().Add(time.Minute)) {
+		kinds[e.Kind] = true
+	}
+	if !kinds[EvCrash] || !kinds[EvReboot] {
+		t.Fatalf("events: %v", kinds)
+	}
+	if got := o2.MonthSum("azure", "chars"); got != 2000 {
+		t.Fatalf("usage after reload: %d", got)
+	}
+	o2.Stop()
+	o2.Flush()
+	o3, _ := OpenOps(path)
+	if o3.Start(time.Now(), boot.Add(time.Hour)) {
+		t.Fatal("clean shutdown must not count as a crash")
+	}
+}
+
+func TestReportBuild(t *testing.T) {
+	o, _ := OpenOps(filepath.Join(t.TempDir(), "ops.json"))
+	o.Start(time.Now(), time.Time{})
+	o.Add("bridge", "messages", 5)
+	o.Add("azure", "requests", 4)
+	o.Add("azure", "chars", 321)
+	o.Add("gemini", "tokens", 77)
+	o.Record(EvError, "deepl: status 503")
+	o.Record(EvError, "deepl: status 503")
+	o.Record(EvCrash, "Бот аварийно остановился")
+	r, err := NewReporter(nil, o, nil, []string{"azure", "deepl", "gemini"}, "Europe/Berlin", "09:00")
+	if err != nil {
+		t.Fatal(err)
+	}
+	txt := r.Build(time.Now().Add(-24*time.Hour), time.Now()) // "to" = now must include the current hour
+	for _, want := range []string{"Переслано всего: 5", "символов: 321", "токенов: 77", "×2", "deepl: status 503", "аварийно"} {
+		if !strings.Contains(txt, want) {
+			t.Fatalf("report misses %q:\n%s", want, txt)
+		}
+	}
+	slot := r.lastSlot(time.Date(2026, 11, 11, 8, 59, 0, 0, r.loc))
+	if slot.Day() != 10 || slot.Hour() != 9 {
+		t.Fatalf("lastSlot before 9:00 must be yesterday 9:00, got %v", slot)
+	}
+	if _, err := NewReporter(nil, o, nil, nil, "Europe/Berlin", "25:00"); err == nil {
+		t.Fatal("bad time must be rejected")
+	}
 }
 
 func TestAzureTranslateAndQuota(t *testing.T) {
@@ -248,15 +299,17 @@ func TestAzureTranslateAndQuota(t *testing.T) {
 		json.NewEncoder(w).Encode([]map[string]any{{"detectedLanguage": map[string]any{"language": "ru"}, "translations": []map[string]string{{"text": out}}}})
 	}))
 	defer srv.Close()
-	c, _ := OpenUsageCounter(filepath.Join(t.TempDir(), "u.json"))
-	a := NewAzure("k", "westeurope", 100, c)
+	ops, _ = OpenOps(filepath.Join(t.TempDir(), "ops.json"))
+	defer func() { ops = nil }()
+	f := NewFallback(NewAzure("k", "westeurope", 100))
+	a := f.chain[0].(*Azure)
 	a.endpoint = srv.URL
-	out, err := a.Translate(context.Background(), "привет <@1> https://x.y/?a=1&b=2", "", LangEN)
+	out, err := f.Translate(context.Background(), "привет <@1> https://x.y/?a=1&b=2", "", LangEN)
 	if err != nil || out != "hello <@1> https://x.y/?a=1&b=2" {
 		t.Fatalf("got %q %v", out, err)
 	}
-	if gotRegion != "westeurope" || c.ThisMonth("azure") == 0 {
-		t.Fatalf("region %q, usage %d", gotRegion, c.ThisMonth("azure"))
+	if used, _, _ := a.Usage(context.Background()); gotRegion != "westeurope" || used == 0 {
+		t.Fatalf("region %q, usage %d", gotRegion, used)
 	}
 	_, err = a.Translate(context.Background(), "hi", "", LangRU)
 	var le *limitError

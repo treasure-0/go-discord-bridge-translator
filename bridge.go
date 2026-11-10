@@ -110,14 +110,14 @@ func (b *Bridge) enqueue(channelID string, job func()) {
 	select {
 	case q <- job:
 	default:
-		log.Printf("queue for %s is full, dropping event", channelID)
+		recordError("очередь канала %s переполнена, событие пропущено", channelID)
 	}
 }
 
 func (b *Bridge) safely(job func()) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("panic in handler: %v", r)
+			recordError("паника в обработчике: %v", r)
 		}
 	}()
 	job()
@@ -186,7 +186,7 @@ func (b *Bridge) mirror(m *discordgo.Message) {
 
 	hook, err := b.webhook(route.Target)
 	if err != nil {
-		log.Printf("webhook for %s: %v", route.Target, err)
+		recordError("вебхук для канала %s: %v", route.Target, err)
 		return
 	}
 
@@ -204,7 +204,7 @@ func (b *Bridge) mirror(m *discordgo.Message) {
 		}
 		msg, err := b.execute(route.Target, &hook, params, files, i == len(chunks)-1)
 		if err != nil {
-			log.Printf("send to %s: %v", route.Target, err)
+			recordError("отправка в канал %s: %v", route.Target, err)
 			break
 		}
 		sent = append(sent, msg.ID)
@@ -225,6 +225,13 @@ func (b *Bridge) mirror(m *discordgo.Message) {
 		TargetText:    snippet(text, snippetLen),
 		ContentHash:   contentHash(m.Content),
 	})
+	ops.Add("bridge", "messages", 1)
+	switch provider {
+	case "passthrough":
+		ops.Add("bridge", "passthrough", 1)
+	case "none":
+		ops.Add("bridge", "untranslated", 1)
+	}
 	log.Printf("mirrored %s -> %s via %s in %s", m.ID, route.Target, provider, time.Since(start).Round(time.Millisecond))
 }
 
@@ -264,7 +271,7 @@ func (b *Bridge) translate(text, hint string, to Lang) (string, string) {
 		provider = b.tr.Name()
 	}
 	if err != nil {
-		log.Printf("translation failed: %v", err)
+		recordError("все переводчики не ответили: %v", err)
 		b.notifier.Alert("all-failed", 15*time.Minute,
 			"🚨 Ни один переводчик не ответил, сообщения пересылаются без перевода. Ошибки: "+truncate(err.Error(), 1500))
 		return text + "\n-# ⚠️ translation unavailable", "none"
@@ -321,7 +328,7 @@ func (b *Bridge) edit(m *discordgo.Message) {
 	}
 	hook, err := b.webhook(rec.TargetChannel)
 	if err != nil || hook.ID != rec.WebhookID {
-		log.Printf("edit %s: webhook unavailable", m.ID)
+		recordError("правка %s: вебхук недоступен", m.ID)
 		return
 	}
 
@@ -340,7 +347,7 @@ func (b *Bridge) edit(m *discordgo.Message) {
 	for i, id := range rec.TargetIDs {
 		if i >= len(chunks) {
 			if err := b.s.WebhookMessageDelete(hook.ID, hook.Token, id); err != nil {
-				log.Printf("edit %s: delete extra part: %v", m.ID, err)
+				recordError("правка %s: удаление лишней части: %v", m.ID, err)
 			}
 			continue
 		}
@@ -349,7 +356,7 @@ func (b *Bridge) edit(m *discordgo.Message) {
 			Content:         &content,
 			AllowedMentions: &discordgo.MessageAllowedMentions{},
 		}); err != nil {
-			log.Printf("edit %s: %v", m.ID, err)
+			recordError("правка %s: %v", m.ID, err)
 		}
 		kept = append(kept, id)
 	}
@@ -370,7 +377,7 @@ func (b *Bridge) remove(sourceID string) {
 	if err == nil && hook.ID == rec.WebhookID {
 		for _, id := range rec.TargetIDs {
 			if err := b.s.WebhookMessageDelete(hook.ID, hook.Token, id); err != nil {
-				log.Printf("delete %s: %v", id, err)
+				recordError("удаление %s: %v", id, err)
 			}
 		}
 	}
@@ -474,7 +481,7 @@ func (b *Bridge) downloadAttachments(atts []*discordgo.MessageAttachment, sticke
 		}
 		data, err := b.fetch(a.URL, budget)
 		if err != nil {
-			log.Printf("attachment %s: %v", a.Filename, err)
+			recordError("вложение %s: %v", a.Filename, err)
 			links = append(links, a.URL)
 			continue
 		}

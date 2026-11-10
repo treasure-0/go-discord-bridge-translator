@@ -12,6 +12,9 @@ so the conversation reads naturally on both sides.
   Overloaded or out-of-quota providers are skipped for a cooldown. The order is configurable via `TRANSLATORS`.
 - **Owner alerts** — a DM and/or admin-channel message when a quota runs low, a provider goes down, every translator
   fails, or the bot restarts.
+- **Daily report** — every day at 09:00 (Europe/Berlin, configurable) the bot posts a `.txt` file with messages
+  mirrored, characters/tokens per translator and remaining quotas, grouped errors, and crashes, restarts,
+  server reboots and Discord disconnects (detected across restarts).
 - **Replies** — webhooks can't create native Discord replies, so a translated reply starts with a quote line
   (`↪ Name: preview`) that links to the counterpart of the replied-to message in the other channel.
 - **Attachments** — files are re-uploaded (Discord CDN links expire); files over the upload limit are posted as links.
@@ -39,7 +42,9 @@ edits and deletions.
 | `bridge.go` | Discord events, webhooks, replies, attachments, edits/deletes |
 | `translate.go` | Gemini and DeepL clients, fallback chain, protection of Discord syntax |
 | `azure.go` | Azure AI Translator client |
-| `notify.go` | owner alerts, quota monitoring, monthly usage counter |
+| `notify.go` | owner alerts, quota monitoring |
+| `ops.go` | usage metrics, event journal, crash/reboot detection |
+| `report.go` | daily `.txt` report |
 | `store.go` | persistent original ↔ translation map |
 | `text.go` | message splitting, previews, helpers |
 | `deploy/` | systemd unit and server install script |

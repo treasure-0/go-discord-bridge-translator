@@ -2,67 +2,13 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
-	"os"
 	"sync"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
 )
-
-// ---------------------------------------------------------------------------
-// Usage counter (for providers that don't report quota themselves)
-// ---------------------------------------------------------------------------
-
-// UsageCounter counts characters per provider per calendar month, persisted to disk.
-type UsageCounter struct {
-	path string
-	mu   sync.Mutex
-	data map[string]int64 // "provider/2026-11" -> characters
-}
-
-func OpenUsageCounter(path string) (*UsageCounter, error) {
-	c := &UsageCounter{path: path, data: map[string]int64{}}
-	raw, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return c, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return c, json.Unmarshal(raw, &c.data)
-}
-
-func monthKey(provider string) string { return provider + "/" + time.Now().UTC().Format("2006-01") }
-
-func (c *UsageCounter) Add(provider string, n int64) {
-	c.mu.Lock()
-	c.data[monthKey(provider)] += n
-	c.mu.Unlock()
-}
-
-func (c *UsageCounter) ThisMonth(provider string) int64 {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.data[monthKey(provider)]
-}
-
-func (c *UsageCounter) Flush() error {
-	c.mu.Lock()
-	raw, err := json.Marshal(c.data)
-	c.mu.Unlock()
-	if err != nil {
-		return err
-	}
-	tmp := c.path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, c.path)
-}
 
 // ---------------------------------------------------------------------------
 // Alerts to the bot owner

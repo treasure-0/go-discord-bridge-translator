@@ -10,23 +10,21 @@ import (
 	"net/url"
 	"strings"
 	"time"
-	"unicode/utf8"
 )
 
 // Azure is Microsoft's Azure AI Translator. Its free tier (F0) renews monthly,
 // so it works well as the primary translator. Azure doesn't report remaining
-// free quota through the API, so characters are counted locally.
+// free quota through the API, so characters are counted locally (see Ops).
 type Azure struct {
 	key, region  string
 	endpoint     string
 	monthlyLimit int64
-	counter      *UsageCounter
 	http         *http.Client
 }
 
-func NewAzure(key, region string, monthlyLimit int64, counter *UsageCounter) *Azure {
+func NewAzure(key, region string, monthlyLimit int64) *Azure {
 	return &Azure{
-		key: key, region: region, monthlyLimit: monthlyLimit, counter: counter,
+		key: key, region: region, monthlyLimit: monthlyLimit,
 		endpoint: "https://api.cognitive.microsofttranslator.com/translate",
 		http:     &http.Client{Timeout: 15 * time.Second},
 	}
@@ -86,16 +84,14 @@ func (a *Azure) Translate(ctx context.Context, text, _ string, to Lang) (string,
 	if err := json.Unmarshal(data, &parsed); err != nil || len(parsed) == 0 || len(parsed[0].Translations) == 0 {
 		return "", fmt.Errorf("azure: bad response: %s", strings.TrimSpace(string(data)))
 	}
-	if a.counter != nil {
-		a.counter.Add(a.Name(), int64(utf8.RuneCountInString(input)))
-	}
 	if strings.HasPrefix(parsed[0].Detected.Language, to.ISO) {
 		return text, nil // already in the target language
 	}
 	return m.restore(parsed[0].Translations[0].Text, true), nil
 }
 
-// Usage reports locally counted characters for the current month.
+// Usage reports locally counted characters for the current month (Azure's API
+// doesn't expose remaining free quota).
 func (a *Azure) Usage(context.Context) (int64, int64, error) {
-	return a.counter.ThisMonth(a.Name()), a.monthlyLimit, nil
+	return ops.MonthSum(a.Name(), "chars"), a.monthlyLimit, nil
 }
