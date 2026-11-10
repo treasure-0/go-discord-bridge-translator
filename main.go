@@ -5,173 +5,120 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/joho/godotenv"
-	"google.golang.org/genai"
 )
 
-// Bot represents the core structure for the AI-powered Discord translator.
-type Bot struct {
-	client     *genai.Client
-	modelName  string
-	safety     []*genai.SafetySetting
-	channelRU  string
-	channelINT string
+// Config holds runtime settings loaded from the environment / .env file.
+type Config struct {
+	DiscordToken string
+	ChannelRU    string
+	ChannelINT   string
+	GeminiKey    string
+	GeminiModel  string
+	DeepLKey     string
+	DataDir      string
+}
+
+func loadConfig() Config {
+	_ = godotenv.Load()
+	cfg := Config{
+		DiscordToken: os.Getenv("DISCORD_TOKEN"),
+		ChannelRU:    os.Getenv("CHANNEL_RU"),
+		ChannelINT:   os.Getenv("CHANNEL_INT"),
+		GeminiKey:    os.Getenv("GEMINI_API_KEY"),
+		GeminiModel:  envOr("GEMINI_MODEL", "gemini-3.1-flash-lite"),
+		DeepLKey:     os.Getenv("DEEPL_API_KEY"),
+		DataDir:      envOr("DATA_DIR", "data"),
+	}
+	if cfg.DiscordToken == "" || cfg.ChannelRU == "" || cfg.ChannelINT == "" {
+		log.Fatal("config: DISCORD_TOKEN, CHANNEL_RU and CHANNEL_INT are required")
+	}
+	if cfg.GeminiKey == "" && cfg.DeepLKey == "" {
+		log.Fatal("config: set at least one of GEMINI_API_KEY or DEEPL_API_KEY")
+	}
+	return cfg
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
 
 func main() {
-	// Load environment variables from .env file.
-	_ = godotenv.Load()
+	cfg := loadConfig()
 
-	discordToken := os.Getenv("DISCORD_TOKEN")
-	geminiAPIKey := os.Getenv("GEMINI_API_KEY")
-	channelRU := os.Getenv("CHANNEL_RU")
-	channelINT := os.Getenv("CHANNEL_INT")
-
-	// Verify that all required environment variables are present.
-	if discordToken == "" || geminiAPIKey == "" || channelRU == "" || channelINT == "" {
-		log.Fatal("Critical Error: Missing required tokens or channel IDs in .env file")
-	}
-
-	// Set up signal handling for graceful shutdown.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Initialize the Google Gemini AI client.
-	genClient, err := genai.NewClient(ctx, &genai.ClientConfig{
-		APIKey:  geminiAPIKey,
-		Backend: genai.BackendGeminiAPI,
-		HTTPOptions: genai.HTTPOptions{
-			APIVersion: "v1beta",
-		},
-	})
-	if err != nil {
-		log.Fatalf("Gemini client initialization failed: %v", err)
-	}
-
-	// Configure safety settings to allow a broad range of translations (no strict filtering).
-	safety := []*genai.SafetySetting{
-		{Category: genai.HarmCategoryDangerousContent, Threshold: genai.HarmBlockThresholdBlockNone},
-		{Category: genai.HarmCategoryHarassment, Threshold: genai.HarmBlockThresholdBlockNone},
-		{Category: genai.HarmCategoryHateSpeech, Threshold: genai.HarmBlockThresholdBlockNone},
-		{Category: genai.HarmCategorySexuallyExplicit, Threshold: genai.HarmBlockThresholdBlockNone},
-	}
-
-	bot := &Bot{
-		client:     genClient,
-		modelName:  "gemini-3.1-flash-lite-preview",
-		safety:     safety,
-		channelRU:  channelRU,
-		channelINT: channelINT,
-	}
-
-	// Create a new Discord session.
-	dg, err := discordgo.New("Bot " + discordToken)
-	if err != nil {
-		log.Fatalf("Discord session initialization failed: %v", err)
-	}
-
-	// Register message event handler.
-	dg.AddHandler(bot.handleMessageCreate)
-
-	// Set required intents: GuildMessages to read messages and GuildWebhooks to mirror identities.
-	dg.Identify.Intents = discordgo.IntentsGuildMessages | discordgo.IntentsGuildWebhooks
-
-	// Establish a connection to Discord.
-	if err := dg.Open(); err != nil {
-		log.Fatalf("Failed to open Discord connection: %v", err)
-	}
-	log.Println("Bridge Translator is live! Webhook mirroring enabled.")
-
-	// Keep the application running until a termination signal is received.
-	<-ctx.Done()
-	dg.Close()
-}
-
-// handleMessageCreate processes incoming messages and sends translations to the target channel.
-func (b *Bot) handleMessageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
-	// Ignore bot messages and webhooks to prevent infinite loops.
-	if m.Author == nil || m.Author.Bot || m.WebhookID != "" {
-		return
-	}
-
-	// Determine the target channel for the translation bridge.
-	var targetChannelID string
-	switch m.ChannelID {
-	case b.channelRU:
-		targetChannelID = b.channelINT
-	case b.channelINT:
-		targetChannelID = b.channelRU
-	default:
-		return
-	}
-
-	// Prepare the AI prompt with explicit language routing.
-	// We tell Gemini to detect the source and translate to the opposite language.
-	prompt := "You are a professional translator between Russian and English. " +
-		"If the text is in Russian, translate it to English. If it is in English, translate to Russian. " +
-		"Preserve the original tone and style (including profanity or slang). " +
-		"Return ONLY the translated text.\n\nMessage:\n" + m.Content
-	
-	// Request translation from the Gemini model.
-	resp, err := b.client.Models.GenerateContent(context.Background(), b.modelName, genai.Text(prompt), &genai.GenerateContentConfig{
-		SafetySettings: b.safety,
-	})
-	if err != nil {
-		log.Printf("Gemini Error: %v", err)
-		return
-	}
-
-	// Validate the AI response.
-	if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
-		return
-	}
-
-	translated := ""
-	for _, part := range resp.Candidates[0].Content.Parts {
-		translated += part.Text
-	}
-
-	if translated == "" {
-		return
-	}
-
-	// --- WEBHOOK LOGIC: Identity Mirroring ---
-	
-	// Fetch existing webhooks in the target channel to find a reusable one.
-	webhooks, err := s.ChannelWebhooks(targetChannelID)
-	if err != nil {
-		log.Printf("Failed to retrieve webhooks: %v", err)
-		return
-	}
-
-	var targetWebhook *discordgo.Webhook
-	for _, w := range webhooks {
-		if w.Name == "Bridge-Translator" {
-			targetWebhook = w
-			break
-		}
-	}
-
-	// Create a new webhook if one doesn't exist.
-	if targetWebhook == nil {
-		targetWebhook, err = s.WebhookCreate(targetChannelID, "Bridge-Translator", "")
+	// Translators: Gemini first (better with slang and tone), DeepL as fallback.
+	var chain []Translator
+	if cfg.GeminiKey != "" {
+		g, err := NewGemini(ctx, cfg.GeminiKey, cfg.GeminiModel)
 		if err != nil {
-			log.Printf("Failed to create webhook: %v", err)
-			return
+			log.Fatalf("gemini: %v", err)
 		}
+		chain = append(chain, g)
+	}
+	if cfg.DeepLKey != "" {
+		chain = append(chain, NewDeepL(cfg.DeepLKey))
+	}
+	translator := NewFallback(chain...)
+
+	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+		log.Fatalf("data dir: %v", err)
+	}
+	store, err := OpenStore(filepath.Join(cfg.DataDir, "messages.json"))
+	if err != nil {
+		log.Fatalf("store: %v", err)
 	}
 
-	// Execute the webhook to send the translation while mimicking the original sender's profile.
-	_, err = s.WebhookExecute(targetWebhook.ID, targetWebhook.Token, false, &discordgo.WebhookParams{
-		Content:   translated,
-		Username:  m.Author.Username,
-		AvatarURL: m.Author.AvatarURL("128"),
-	})
-
+	dg, err := discordgo.New("Bot " + cfg.DiscordToken)
 	if err != nil {
-		log.Printf("Webhook execution error: %v", err)
+		log.Fatalf("discord: %v", err)
+	}
+	// MessageContent is a privileged intent: it must also be enabled in the
+	// Developer Portal (Bot -> Privileged Gateway Intents), otherwise message text arrives empty.
+	dg.Identify.Intents = discordgo.IntentsGuildMessages | discordgo.IntentsGuildWebhooks | discordgo.IntentMessageContent
+
+	bridge := NewBridge(dg, translator, store, map[string]Route{
+		cfg.ChannelRU:  {Target: cfg.ChannelINT, Lang: LangEN},
+		cfg.ChannelINT: {Target: cfg.ChannelRU, Lang: LangRU},
+	})
+	bridge.Register()
+
+	if err := dg.Open(); err != nil {
+		log.Fatalf("discord connect: %v", err)
+	}
+	log.Printf("bridge is live (translators: %s)", translator.Name())
+
+	// Persist the message map periodically.
+	go func() {
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if err := store.Flush(); err != nil {
+					log.Printf("store flush: %v", err)
+				}
+			}
+		}
+	}()
+
+	<-ctx.Done()
+	log.Println("shutting down...")
+	bridge.Close()
+	_ = dg.Close()
+	if err := store.Flush(); err != nil {
+		log.Printf("store flush: %v", err)
 	}
 }
