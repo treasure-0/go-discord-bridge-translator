@@ -5,8 +5,11 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
@@ -53,14 +56,29 @@ func (r *Reporter) Run(ctx context.Context) {
 	} else if r.ops.LastReport().Before(r.lastSlot(time.Now())) {
 		r.send(time.Now())
 	}
+	// SIGUSR1 sends a report on demand: sudo systemctl kill -s USR1 discord-translator
+	now := make(chan os.Signal, 1)
+	signal.Notify(now, syscall.SIGUSR1)
+	defer signal.Stop(now)
 	for {
 		next := r.lastSlot(time.Now()).AddDate(0, 0, 1)
 		select {
 		case <-ctx.Done():
 			return
+		case <-now:
+			r.sendOnDemand(time.Now())
 		case <-time.After(time.Until(next)):
 			r.send(time.Now())
 		}
+	}
+}
+
+// sendOnDemand reports the last 24 hours without moving the daily report window.
+func (r *Reporter) sendOnDemand(now time.Time) {
+	text := r.Build(now.Add(-24*time.Hour), now)
+	name := "bot-report-" + now.In(r.loc).Format("2006-01-02_1504") + ".txt"
+	if err := r.n.SendFile("📊 Сводка бота-переводчика по запросу (последние 24 часа)", name, text); err != nil {
+		log.Printf("on-demand report: %v", err)
 	}
 }
 
