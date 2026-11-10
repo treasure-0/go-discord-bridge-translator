@@ -153,7 +153,7 @@ func llmPrompts(m masked, hint string, to Lang) (system, user string) {
 	system = "You are a translator for a gaming/community Discord server. Translate the user's chat message into " + to.Name + ". " +
 		"If the message is already in " + to.Name + ", return it unchanged. " +
 		"Translate the meaning and intent, not word by word: the result must sound like a native speaker wrote it in chat. " +
-		"Understand abbreviations, internet and gaming slang, memes and typos (e.g. имхо, кек, лол, спс, норм, гг, афк, " +
+		"Understand abbreviations, internet and gaming slang, idioms, memes and typos (e.g. имхо, кек, лол, спс, норм, гг, афк, " +
 		"imo, tbh, ngl, gg, wp, afk, brb) and render them with natural equivalents in " + to.Name + ". " +
 		"Keep the tone and register; translate profanity with an equivalent of the same strength, never censor or soften it. " +
 		"Keep emoji, names and Discord markdown (**bold**, *italic*, ||spoiler||, > quotes, line breaks). " +

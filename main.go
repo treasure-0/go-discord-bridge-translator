@@ -48,7 +48,7 @@ func loadConfig() Config {
 		ChannelINT:     os.Getenv("CHANNEL_INT"),
 		Translators:    strings.Split(strings.ReplaceAll(envOr("TRANSLATORS", "groq,azure,deepl,gemini"), " ", ""), ","),
 		GroqKey:        os.Getenv("GROQ_API_KEY"),
-		GroqModel:      envOr("GROQ_MODEL", "openai/gpt-oss-120b"),
+		GroqModel:      envOr("GROQ_MODEL", "qwen/qwen3.8-27b"),
 		AzureKey:       os.Getenv("AZURE_TRANSLATOR_KEY"),
 		AzureRegion:    envOr("AZURE_TRANSLATOR_REGION", "global"),
 		AzureLimit:     envInt("AZURE_MONTHLY_LIMIT", 2_000_000),

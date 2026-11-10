@@ -12,7 +12,8 @@ import (
 	"time"
 )
 
-// Groq runs open LLMs on its own hardware with an OpenAI-compatible API.
+// Groq runs open LLMs (default qwen/qwen3.8-27b: ~0.2s, the most natural chat
+// translations in our tests) on its own hardware with an OpenAI-compatible API.
 // It answers in well under a second, so the bot gets LLM-quality translation
 // (slang, abbreviations, swearing) without the latency of free Gemini.
 type Groq struct {
@@ -44,10 +45,13 @@ func (g *Groq) Translate(ctx context.Context, text, hint string, to Lang) (strin
 		"temperature": 0.2,
 		"max_tokens":  2048,
 	}
-	// gpt-oss models reason before answering; keep it short and out of the reply.
-	if strings.Contains(g.model, "gpt-oss") {
+	// Reasoning models: keep thinking short and out of the reply.
+	switch {
+	case strings.Contains(g.model, "gpt-oss"):
 		body["reasoning_effort"] = "low"
 		body["include_reasoning"] = false
+	case strings.Contains(g.model, "qwen"):
+		body["reasoning_format"] = "hidden"
 	}
 	raw, _ := json.Marshal(body)
 
