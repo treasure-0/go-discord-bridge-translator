@@ -120,13 +120,13 @@ func (r *Reporter) Build(from, to time.Time) string {
 		}
 	}
 	b.WriteString("ИСПОЛЬЗОВАНИЕ ПЕРЕВОДЧИКОВ (за период)\n")
-	b.WriteString("  Azure и DeepL считают символы, Gemini — токены.\n")
+	b.WriteString("  Azure и DeepL считают символы, ИИ-модели (Groq, Gemini) — токены.\n")
 	for _, p := range r.providers {
 		req := r.ops.Sum(p, "requests", from, to)
 		chars := r.ops.Sum(p, "chars", from, to)
 		errs := r.ops.Sum(p, "errors", from, to)
 		fmt.Fprintf(&b, "  %s:\n    запросов: %d, символов: %s, ошибок: %d\n", p, req, humanInt(chars), errs)
-		if p == "gemini" {
+		if p == "gemini" || p == "groq" {
 			fmt.Fprintf(&b, "    токенов: %s (за месяц: %s)\n",
 				humanInt(r.ops.Sum(p, "tokens", from, to)), humanInt(r.ops.MonthSum(p, "tokens")))
 		}

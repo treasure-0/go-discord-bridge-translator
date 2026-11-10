@@ -317,3 +317,40 @@ func TestAzureTranslateAndQuota(t *testing.T) {
 		t.Fatalf("expected long cooldown on quota error, got %v", err)
 	}
 }
+
+func TestGroqTranslateAndRateLimit(t *testing.T) {
+	var gotBody map[string]any
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls > 1 {
+			w.Header().Set("Retry-After", "7")
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"error":{"message":"rate limit"}}`))
+			return
+		}
+		json.NewDecoder(r.Body).Decode(&gotBody)
+		msgs := gotBody["messages"].([]any)
+		user := msgs[1].(map[string]any)["content"].(string)
+		out := strings.Replace(user, "кек, имхо", "lol, imo", 1)
+		json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]string{"content": out}}},
+			"usage":   map[string]int{"total_tokens": 42},
+		})
+	}))
+	defer srv.Close()
+	g := NewGroq("k", "openai/gpt-oss-120b")
+	g.endpoint = srv.URL
+	out, err := g.Translate(context.Background(), "кек, имхо <@5>", "", LangEN)
+	if err != nil || out != "lol, imo <@5>" {
+		t.Fatalf("got %q %v", out, err)
+	}
+	if gotBody["reasoning_effort"] != "low" || !strings.Contains(gotBody["messages"].([]any)[0].(map[string]any)["content"].(string), "slang") {
+		t.Fatalf("request: %v", gotBody)
+	}
+	_, err = g.Translate(context.Background(), "x", "", LangEN)
+	var le *limitError
+	if !errors.As(err, &le) || le.cooldown != 8*time.Second {
+		t.Fatalf("expected Retry-After based cooldown, got %v", err)
+	}
+}

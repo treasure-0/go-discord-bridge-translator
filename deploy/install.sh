@@ -67,6 +67,7 @@ if [[ ! -f "$ENV_FILE" ]]; then
   FIRST_RUN=1
 fi
 install -m 644 "$APP_DIR/src/deploy/$SERVICE.service" "/etc/systemd/system/$SERVICE.service"
+install -m 755 "$APP_DIR/src/deploy/bot-set-key" /usr/local/bin/bot-set-key
 systemctl daemon-reload
 systemctl enable -q "$SERVICE"
 

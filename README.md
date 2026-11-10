@@ -7,8 +7,10 @@ so the conversation reads naturally on both sides.
 ## Features
 
 - **Identity mirroring** — translations are posted through a webhook with the author's server nickname and avatar.
-- **Fast, fault-tolerant translation** — a chain of free providers: **Azure AI Translator** (2M chars/month, renews
-  monthly) → **DeepL** (1M chars in total, kept as reserve) → **Google Gemini** (good with slang, slow on the free tier).
+- **AI translation that gets chat language** — an LLM on **Groq** (sub-second responses) translates meaning rather
+  than words: abbreviations, gaming/internet slang, memes and swearing of the same strength.
+- **Fault-tolerant** — if the LLM is rate-limited or down, the bot falls back to machine translation:
+  **Azure AI Translator** (2M chars/month) → **DeepL** (1M chars in total, reserve) → **Google Gemini** (slow free tier).
   Overloaded or out-of-quota providers are skipped for a cooldown. The order is configurable via `TRANSLATORS`.
 - **Owner alerts** — a DM and/or admin-channel message when a quota runs low, a provider goes down, every translator
   fails, or the bot restarts.
@@ -30,7 +32,7 @@ so the conversation reads naturally on both sides.
 ## How it works
 
 ```
-#russian ──MessageCreate──▶ queue ──▶ Azure ─▶ DeepL ─▶ Gemini (first that answers) ──▶ webhook (author name + avatar) ──▶ #international
+#russian ──MessageCreate──▶ queue ──▶ Groq ─▶ Azure ─▶ DeepL ─▶ Gemini (first that answers) ──▶ webhook (author name + avatar) ──▶ #international
 #international ─────────────────────────── same pipeline, translated to Russian ──────────────────────▶ #russian
 ```
 
@@ -42,6 +44,7 @@ edits and deletions.
 | `main.go` | config, startup, graceful shutdown |
 | `bridge.go` | Discord events, webhooks, replies, attachments, edits/deletes |
 | `translate.go` | Gemini and DeepL clients, fallback chain, protection of Discord syntax |
+| `groq.go` | Groq LLM client (OpenAI-compatible) |
 | `azure.go` | Azure AI Translator client |
 | `notify.go` | owner alerts, quota monitoring |
 | `ops.go` | usage metrics, event journal, crash/reboot detection |
@@ -61,6 +64,7 @@ edits and deletions.
 
 ### 2. API keys (free tiers are enough for a community server)
 
+- Groq (free, no card): <https://console.groq.com/keys>
 - Azure AI Translator (free tier F0): create a *Translator* resource in the Azure portal → *Keys and Endpoint*
 - DeepL API Developer (key ends with `:fx`): <https://www.deepl.com/pro-api>
 - Gemini: <https://aistudio.google.com/apikey>
@@ -78,7 +82,7 @@ go run .
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/treasure-0/go-discord-bridge-translator/main/deploy/install.sh | sudo bash
-sudo nano /etc/discord-translator.env        # paste tokens
+sudo nano /etc/discord-translator.env        # paste tokens (or: printf '%s\n' KEY | sudo bot-set-key groq)
 sudo systemctl start discord-translator
 journalctl -u discord-translator -f          # live logs
 ```

@@ -23,6 +23,8 @@ type Config struct {
 	ChannelINT   string
 
 	Translators  []string // order of preference
+	GroqKey      string
+	GroqModel    string
 	AzureKey     string
 	AzureRegion  string
 	AzureLimit   int64 // free monthly characters
@@ -44,7 +46,9 @@ func loadConfig() Config {
 		DiscordToken:   os.Getenv("DISCORD_TOKEN"),
 		ChannelRU:      os.Getenv("CHANNEL_RU"),
 		ChannelINT:     os.Getenv("CHANNEL_INT"),
-		Translators:    strings.Split(strings.ReplaceAll(envOr("TRANSLATORS", "azure,deepl,gemini"), " ", ""), ","),
+		Translators:    strings.Split(strings.ReplaceAll(envOr("TRANSLATORS", "groq,azure,deepl,gemini"), " ", ""), ","),
+		GroqKey:        os.Getenv("GROQ_API_KEY"),
+		GroqModel:      envOr("GROQ_MODEL", "openai/gpt-oss-120b"),
 		AzureKey:       os.Getenv("AZURE_TRANSLATOR_KEY"),
 		AzureRegion:    envOr("AZURE_TRANSLATOR_REGION", "global"),
 		AzureLimit:     envInt("AZURE_MONTHLY_LIMIT", 2_000_000),
@@ -111,13 +115,18 @@ func main() {
 	dg.Identify.Intents = discordgo.IntentsGuildMessages | discordgo.IntentsGuildWebhooks | discordgo.IntentMessageContent
 	notifier := NewNotifier(dg, cfg.AlertUserID, cfg.AlertChannelID)
 
-	// Translators in order of preference (TRANSLATORS, default "azure,deepl,gemini").
+	// Translators in order of preference (TRANSLATORS, default "groq,azure,deepl,gemini"):
+	// an LLM first for slang and tone, machine translation as fast fallbacks.
 	// Providers without an API key are skipped.
 	var chain []Translator
 	var quotas []QuotaReporter
 	var names []string
 	for _, name := range cfg.Translators {
 		switch name {
+		case "groq":
+			if cfg.GroqKey != "" {
+				chain = append(chain, NewGroq(cfg.GroqKey, cfg.GroqModel))
+			}
 		case "azure":
 			if cfg.AzureKey != "" {
 				a := NewAzure(cfg.AzureKey, cfg.AzureRegion, cfg.AzureLimit)

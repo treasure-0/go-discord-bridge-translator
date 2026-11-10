@@ -1,0 +1,33 @@
+#!/bin/bash
+# bot-set-key PROVIDER — validates a translator API key and stores it in the bot config.
+# Reads the key (and, for Azure, the region) from stdin so it never appears in
+# the process list or shell history. Installed to /usr/local/bin by install.sh.
+#   printf '%s\n%s\n' "$KEY" "$REGION" | sudo bot-set-key azure
+set -e
+P=$1; read -r K; read -r REGION || true; REGION=${REGION:-global}
+ENV=/etc/discord-translator.env
+setvar(){ sed -i "/^$1=/d" "$ENV"; echo "$1=$2" >> "$ENV"; }
+case "$P" in
+groq)
+  R=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $K" https://api.groq.com/openai/v1/models)
+  [ "$R" = 200 ] || { echo "Ключ Groq не подошёл (HTTP $R)"; exit 1; }
+  echo "Ключ Groq рабочий"; setvar GROQ_API_KEY "$K";;
+deepl)
+  case "$K" in *:fx) U=https://api-free.deepl.com;; *) U=https://api.deepl.com;; esac
+  R=$(curl -s -w ' %{http_code}' -H "Authorization: DeepL-Auth-Key $K" "$U/v2/usage")
+  [[ $R == *" 200" ]] || { echo "Ключ DeepL не подошёл: $R"; exit 1; }
+  echo "Ключ DeepL рабочий, использовано: ${R% 200}"; setvar DEEPL_API_KEY "$K";;
+azure)
+  H=(-H "Ocp-Apim-Subscription-Key: $K" -H "Content-Type: application/json")
+  [ "$REGION" != global ] && H+=(-H "Ocp-Apim-Subscription-Region: $REGION")
+  R=$(curl -s -w ' %{http_code}' "${H[@]}" -d '[{"Text":"Привет, как дела?"}]' "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=en")
+  [[ $R == *" 200" ]] || { echo "Ключ Azure не подошёл: $R"; exit 1; }
+  echo "Ключ Azure рабочий, тест: ${R% 200}"; setvar AZURE_TRANSLATOR_KEY "$K"; setvar AZURE_TRANSLATOR_REGION "$REGION";;
+gemini)
+  R=$(curl -s -o /dev/null -w '%{http_code}' -H "x-goog-api-key: $K" https://generativelanguage.googleapis.com/v1beta/models)
+  [ "$R" = 200 ] || { echo "Ключ Gemini не подошёл (HTTP $R)"; exit 1; }
+  echo "Ключ Gemini рабочий"; setvar GEMINI_API_KEY "$K";;
+*) echo "Использование: bot-set-key groq|azure|deepl|gemini"; exit 1;;
+esac
+systemctl restart discord-translator; sleep 5
+journalctl -u discord-translator -n 2 -o cat

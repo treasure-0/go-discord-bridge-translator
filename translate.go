@@ -143,6 +143,31 @@ func needsTranslation(s string) bool {
 }
 
 // ---------------------------------------------------------------------------
+// LLM prompt (shared by Gemini and Groq)
+// ---------------------------------------------------------------------------
+
+// llmPrompts builds the system and user prompts for chat-model translators.
+// The point of an LLM here is to understand chat language that machine
+// translation misses: abbreviations, gaming/internet slang, memes and swearing.
+func llmPrompts(m masked, hint string, to Lang) (system, user string) {
+	system = "You are a translator for a gaming/community Discord server. Translate the user's chat message into " + to.Name + ". " +
+		"If the message is already in " + to.Name + ", return it unchanged. " +
+		"Translate the meaning and intent, not word by word: the result must sound like a native speaker wrote it in chat. " +
+		"Understand abbreviations, internet and gaming slang, memes and typos (e.g. имхо, кек, лол, спс, норм, гг, афк, " +
+		"imo, tbh, ngl, gg, wp, afk, brb) and render them with natural equivalents in " + to.Name + ". " +
+		"Keep the tone and register; translate profanity with an equivalent of the same strength, never censor or soften it. " +
+		"Keep emoji, names and Discord markdown (**bold**, *italic*, ||spoiler||, > quotes, line breaks). " +
+		`Keep every <x i="N"/> tag exactly as written, in the matching position. ` +
+		"Output only the translation, with no quotes, notes or explanations."
+	user = m.render(false)
+	if hint != "" {
+		user = "Earlier message, for context only (do not translate or output it):\n" + hint +
+			"\n\nMessage to translate:\n" + user
+	}
+	return system, user
+}
+
+// ---------------------------------------------------------------------------
 // Gemini
 // ---------------------------------------------------------------------------
 
@@ -166,18 +191,7 @@ func (g *Gemini) Label() string { return "gemini(" + g.model + ")" }
 
 func (g *Gemini) Translate(ctx context.Context, text, hint string, to Lang) (string, error) {
 	m := mask(text)
-	system := "You translate Discord chat messages into " + to.Name + ". " +
-		"If the message is already in " + to.Name + ", return it unchanged. " +
-		"Convey the original meaning naturally, keeping tone, slang, profanity, emoji and Discord markdown " +
-		"(**bold**, *italic*, ||spoiler||, > quotes, line breaks). " +
-		`Keep every <x i="N"/> tag exactly as written, in the matching position. ` +
-		"Output only the translation, with no quotes, notes or explanations."
-
-	prompt := m.render(false)
-	if hint != "" {
-		prompt = "Earlier message, for context only (do not translate or output it):\n" + hint +
-			"\n\nMessage to translate:\n" + prompt
-	}
+	system, prompt := llmPrompts(m, hint, to)
 
 	temp := float32(0.2)
 	cfg := &genai.GenerateContentConfig{
