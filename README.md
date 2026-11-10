@@ -7,8 +7,9 @@ so the conversation reads naturally on both sides.
 ## Features
 
 - **Identity mirroring** — translations are posted through a webhook with the author's server nickname and avatar.
-- **Meaning-first translation** — Google Gemini (Flash-Lite) keeps tone, slang and profanity; when Gemini is
-  unavailable or out of free quota, the bot falls back to **DeepL API Free** automatically.
+- **Fast, fault-tolerant translation** — **DeepL API Free** answers in a fraction of a second; if it is down or its
+  monthly quota is used up, the bot switches to **Google Gemini** (Flash-Lite, good with slang) automatically.
+  Overloaded or rate-limited providers are skipped for a cooldown. The order is configurable via `TRANSLATORS`.
 - **Replies** — webhooks can't create native Discord replies, so a translated reply starts with a quote line
   (`↪ Name: preview`) that links to the counterpart of the replied-to message in the other channel.
 - **Attachments** — files are re-uploaded (Discord CDN links expire); files over the upload limit are posted as links.
@@ -23,7 +24,7 @@ so the conversation reads naturally on both sides.
 ## How it works
 
 ```
-#russian ──MessageCreate──▶ queue ──▶ Gemini ─(fail/429)─▶ DeepL ──▶ webhook (author name + avatar) ──▶ #international
+#russian ──MessageCreate──▶ queue ──▶ DeepL ─(fail/quota)─▶ Gemini ──▶ webhook (author name + avatar) ──▶ #international
 #international ─────────────────────────── same pipeline, translated to Russian ──────────────────────▶ #russian
 ```
 

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 )
@@ -188,5 +189,24 @@ func TestReplyPrefixPointsAtCounterpart(t *testing.T) {
 	got = b.replyPrefix(m, b.routes["int"])
 	if !strings.Contains(got, "/g/ru/100") || !strings.Contains(got, "привет") {
 		t.Fatalf("reply to translation: %q", got)
+	}
+}
+
+func TestFallbackUsesProviderCooldown(t *testing.T) {
+	a := &fakeTr{name: "a", err: &limitError{msg: "quota", cooldown: time.Hour}}
+	b := &fakeTr{name: "b", out: "ok"}
+	f := NewFallback(a, b)
+	_, name, err := f.TranslateNamed(context.Background(), "x", "", LangEN)
+	if err != nil || name != "b" {
+		t.Fatalf("got %q %v", name, err)
+	}
+	f.mu.Lock()
+	until := f.skipUntil["a"]
+	f.mu.Unlock()
+	if time.Until(until) < 50*time.Minute {
+		t.Fatalf("expected ~1h cooldown, got %s", time.Until(until))
+	}
+	if !errors.Is(&limitError{}, errRateLimited) {
+		t.Fatal("limitError must match errRateLimited")
 	}
 }

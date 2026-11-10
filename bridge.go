@@ -251,12 +251,21 @@ func (b *Bridge) translate(text, hint string, to Lang) (string, string) {
 	if !needsTranslation(text) {
 		return text, "passthrough"
 	}
-	out, err := b.tr.Translate(b.ctx, text, hint, to)
+	var out, provider string
+	var err error
+	if named, ok := b.tr.(interface {
+		TranslateNamed(context.Context, string, string, Lang) (string, string, error)
+	}); ok {
+		out, provider, err = named.TranslateNamed(b.ctx, text, hint, to)
+	} else {
+		out, err = b.tr.Translate(b.ctx, text, hint, to)
+		provider = b.tr.Name()
+	}
 	if err != nil {
 		log.Printf("translation failed: %v", err)
 		return text + "\n-# ⚠️ translation unavailable", "none"
 	}
-	return out, b.tr.Name()
+	return out, provider
 }
 
 func forwardedLabel(to Lang) string {

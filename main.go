@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,6 +22,7 @@ type Config struct {
 	GeminiKey    string
 	GeminiModel  string
 	DeepLKey     string
+	Translators  []string // order of preference
 	DataDir      string
 }
 
@@ -34,6 +36,7 @@ func loadConfig() Config {
 		GeminiModel:  envOr("GEMINI_MODEL", "gemini-3.1-flash-lite"),
 		DeepLKey:     os.Getenv("DEEPL_API_KEY"),
 		DataDir:      envOr("DATA_DIR", "data"),
+		Translators:  strings.Split(strings.ReplaceAll(envOr("TRANSLATORS", "deepl,gemini"), " ", ""), ","),
 	}
 	if cfg.DiscordToken == "" || cfg.ChannelRU == "" || cfg.ChannelINT == "" {
 		log.Fatal("config: DISCORD_TOKEN, CHANNEL_RU and CHANNEL_INT are required")
@@ -57,17 +60,29 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Translators: Gemini first (better with slang and tone), DeepL as fallback.
+	// Translators in order of preference (TRANSLATORS, default "deepl,gemini"):
+	// DeepL is fast and reliable; Gemini is better with slang but slow on the free tier.
 	var chain []Translator
-	if cfg.GeminiKey != "" {
-		g, err := NewGemini(ctx, cfg.GeminiKey, cfg.GeminiModel)
-		if err != nil {
-			log.Fatalf("gemini: %v", err)
+	for _, name := range cfg.Translators {
+		switch name {
+		case "deepl":
+			if cfg.DeepLKey != "" {
+				chain = append(chain, NewDeepL(cfg.DeepLKey))
+			}
+		case "gemini":
+			if cfg.GeminiKey != "" {
+				g, err := NewGemini(ctx, cfg.GeminiKey, cfg.GeminiModel)
+				if err != nil {
+					log.Fatalf("gemini: %v", err)
+				}
+				chain = append(chain, g)
+			}
+		default:
+			log.Fatalf("config: unknown translator %q in TRANSLATORS", name)
 		}
-		chain = append(chain, g)
 	}
-	if cfg.DeepLKey != "" {
-		chain = append(chain, NewDeepL(cfg.DeepLKey))
+	if len(chain) == 0 {
+		log.Fatal("config: no translator is configured (check TRANSLATORS and API keys)")
 	}
 	translator := NewFallback(chain...)
 

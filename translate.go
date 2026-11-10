@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"log"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -37,9 +38,19 @@ type Translator interface {
 	Translate(ctx context.Context, text, hint string, to Lang) (string, error)
 }
 
-// errRateLimited marks provider errors caused by quotas, so the fallback chain
-// can temporarily skip that provider.
+// errRateLimited marks provider errors caused by quotas or overload, so the
+// fallback chain can temporarily skip that provider.
 var errRateLimited = errors.New("rate limited")
+
+// limitError is a rate-limit error with a provider-specific cooldown
+// (e.g. DeepL's monthly quota is skipped much longer than a per-minute limit).
+type limitError struct {
+	msg      string
+	cooldown time.Duration
+}
+
+func (e *limitError) Error() string        { return e.msg }
+func (e *limitError) Is(target error) bool { return target == errRateLimited }
 
 // ---------------------------------------------------------------------------
 // Protecting Discord syntax from the translator
@@ -178,8 +189,9 @@ func (g *Gemini) Translate(ctx context.Context, text, hint string, to Lang) (str
 	resp, err := g.client.Models.GenerateContent(ctx, g.model, genai.Text(prompt), cfg)
 	if err != nil {
 		var apiErr genai.APIError
-		if errors.As(err, &apiErr) && apiErr.Code == http.StatusTooManyRequests {
-			return "", fmt.Errorf("%w: %v", errRateLimited, err)
+		// 429 = quota, 503 = "model is experiencing high demand" (common on the free tier).
+		if errors.As(err, &apiErr) && (apiErr.Code == http.StatusTooManyRequests || apiErr.Code == http.StatusServiceUnavailable) {
+			return "", &limitError{msg: err.Error(), cooldown: 30 * time.Second}
 		}
 		return "", err
 	}
@@ -238,8 +250,10 @@ func (d *DeepL) Translate(ctx context.Context, text, hint string, to Lang) (stri
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 
 	switch {
-	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == 456: // 456 = monthly quota used up
-		return "", fmt.Errorf("%w: deepl status %d", errRateLimited, resp.StatusCode)
+	case resp.StatusCode == 456: // monthly character quota used up
+		return "", &limitError{msg: "deepl: monthly quota exceeded", cooldown: time.Hour}
+	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable:
+		return "", &limitError{msg: fmt.Sprintf("deepl status %d", resp.StatusCode), cooldown: 30 * time.Second}
 	case resp.StatusCode != http.StatusOK:
 		return "", fmt.Errorf("deepl status %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
 	}
@@ -289,6 +303,12 @@ func (f *Fallback) Name() string {
 }
 
 func (f *Fallback) Translate(ctx context.Context, text, hint string, to Lang) (string, error) {
+	out, _, err := f.TranslateNamed(ctx, text, hint, to)
+	return out, err
+}
+
+// TranslateNamed also reports which provider produced the translation.
+func (f *Fallback) TranslateNamed(ctx context.Context, text, hint string, to Lang) (string, string, error) {
 	var errs []error
 	for i, t := range f.chain {
 		last := i == len(f.chain)-1
@@ -303,14 +323,20 @@ func (f *Fallback) Translate(ctx context.Context, text, hint string, to Lang) (s
 		out, err := t.Translate(cctx, text, hint, to)
 		cancel()
 		if err == nil {
-			return out, nil
+			return out, t.Name(), nil
 		}
 		if errors.Is(err, errRateLimited) {
+			cd := f.cooldown
+			var le *limitError
+			if errors.As(err, &le) && le.cooldown > 0 {
+				cd = le.cooldown
+			}
 			f.mu.Lock()
-			f.skipUntil[t.Name()] = time.Now().Add(f.cooldown)
+			f.skipUntil[t.Name()] = time.Now().Add(cd)
 			f.mu.Unlock()
+			log.Printf("%s unavailable, skipping it for %s: %v", t.Name(), cd, err)
 		}
 		errs = append(errs, fmt.Errorf("%s: %w", t.Name(), err))
 	}
-	return "", errors.Join(errs...)
+	return "", "", errors.Join(errs...)
 }
