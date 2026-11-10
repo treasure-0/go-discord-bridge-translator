@@ -144,9 +144,9 @@ type fakeTr struct {
 }
 
 func (f *fakeTr) Name() string { return f.name }
-func (f *fakeTr) Translate(context.Context, string, string, Lang) (string, error) {
+func (f *fakeTr) Translate(context.Context, string, string, Lang) (Result, error) {
 	f.hits++
-	return f.out, f.err
+	return Result{Text: f.out}, f.err
 }
 
 func TestFallbackSkipsRateLimitedProvider(t *testing.T) {
@@ -155,7 +155,7 @@ func TestFallbackSkipsRateLimitedProvider(t *testing.T) {
 	f := NewFallback(a, b)
 	for i := 0; i < 3; i++ {
 		out, err := f.Translate(context.Background(), "x", "", LangEN)
-		if err != nil || out != "ok" {
+		if err != nil || out.Text != "ok" {
 			t.Fatalf("got %q %v", out, err)
 		}
 	}
@@ -305,7 +305,7 @@ func TestAzureTranslateAndQuota(t *testing.T) {
 	a := f.chain[0].(*Azure)
 	a.endpoint = srv.URL
 	out, err := f.Translate(context.Background(), "привет <@1> https://x.y/?a=1&b=2", "", LangEN)
-	if err != nil || out != "hello <@1> https://x.y/?a=1&b=2" {
+	if err != nil || out.Text != "hello <@1> https://x.y/?a=1&b=2" || out.Lang != "ru" {
 		t.Fatalf("got %q %v", out, err)
 	}
 	if used, _, _ := a.Usage(context.Background()); gotRegion != "westeurope" || used == 0 {
@@ -333,8 +333,9 @@ func TestGroqTranslateAndRateLimit(t *testing.T) {
 		msgs := gotBody["messages"].([]any)
 		user := msgs[1].(map[string]any)["content"].(string)
 		out := strings.Replace(user, "кек, имхо", "lol, imo", 1)
+		reply, _ := json.Marshal(map[string]string{"lang": "ru", "translation": out})
 		json.NewEncoder(w).Encode(map[string]any{
-			"choices": []map[string]any{{"message": map[string]string{"content": out}}},
+			"choices": []map[string]any{{"message": map[string]string{"content": string(reply)}}},
 			"usage":   map[string]int{"total_tokens": 42},
 		})
 	}))
@@ -342,15 +343,64 @@ func TestGroqTranslateAndRateLimit(t *testing.T) {
 	g := NewGroq("k", "openai/gpt-oss-120b")
 	g.endpoint = srv.URL
 	out, err := g.Translate(context.Background(), "кек, имхо <@5>", "", LangEN)
-	if err != nil || out != "lol, imo <@5>" {
+	if err != nil || out.Text != "lol, imo <@5>" || out.Lang != "ru" {
 		t.Fatalf("got %q %v", out, err)
 	}
-	if gotBody["reasoning_effort"] != "low" || !strings.Contains(gotBody["messages"].([]any)[0].(map[string]any)["content"].(string), "slang") {
+	if gotBody["response_format"] == nil || gotBody["reasoning_effort"] != "low" || !strings.Contains(gotBody["messages"].([]any)[0].(map[string]any)["content"].(string), "slang") {
 		t.Fatalf("request: %v", gotBody)
 	}
 	_, err = g.Translate(context.Background(), "x", "", LangEN)
 	var le *limitError
 	if !errors.As(err, &le) || le.cooldown != 8*time.Second {
 		t.Fatalf("expected Retry-After based cooldown, got %v", err)
+	}
+}
+
+func TestParseLLM(t *testing.T) {
+	cases := []struct{ in, text, lang string }{
+		{`{"lang":"DE","translation":"Hallo"}`, "Hallo", "de"},
+		{"```json\n{\"lang\":\"pt-BR\",\"translation\":\"oi\"}\n```", "oi", "pt"},
+		{"just text", "just text", ""},
+	}
+	for _, c := range cases {
+		if text, lang := parseLLM(c.in); text != c.text || lang != c.lang {
+			t.Errorf("parseLLM(%q) = %q %q", c.in, text, lang)
+		}
+	}
+}
+
+func TestNeedsLocalCopy(t *testing.T) {
+	ru := Route{Target: "int", Lang: LangEN, Local: LangRU}
+	cases := []struct {
+		text, lang string
+		want       bool
+	}{
+		{"Ich habe heute keine Zeit zum Spielen", "de", true},
+		{"I will be online later tonight", "en", true}, // neighbour's language is foreign here too
+		{"danke", "de", false},                         // too short
+		{"gg wp", "en", false},
+		{"привет всем, как дела у вас", "ru", false}, // local language
+		{"hmm what is this", "und", false},
+		{"", "", false},
+	}
+	for _, c := range cases {
+		if got := needsLocalCopy(c.text, c.lang, ru); got != c.want {
+			t.Errorf("needsLocalCopy(%q, %q) = %v, want %v", c.text, c.lang, got, c.want)
+		}
+	}
+	if got := localCopyText("de", ru, "Сегодня нет времени"); got != "🌐 **DE → RU:** Сегодня нет времени" {
+		t.Fatalf("localCopyText: %q", got)
+	}
+}
+
+func TestReplyToLocalCopyPointsAtTranslation(t *testing.T) {
+	s, _ := OpenStore(filepath.Join(t.TempDir(), "m.json"))
+	s.Put(Record{SourceID: "100", SourceChannel: "ru", TargetChannel: "int", TargetIDs: []string{"200"},
+		LocalID: "300", Author: "Hans", TargetText: "no time today"})
+	b := &Bridge{store: s, routes: map[string]Route{"ru": {Target: "int", Lang: LangEN, Local: LangRU}}}
+	m := &discordgo.Message{GuildID: "g", ChannelID: "ru", MessageReference: &discordgo.MessageReference{},
+		ReferencedMessage: &discordgo.Message{ID: "300", ChannelID: "ru"}}
+	if got := b.replyPrefix(m, b.routes["ru"]); !strings.Contains(got, "/g/int/200") {
+		t.Fatalf("reply to local copy: %q", got)
 	}
 }

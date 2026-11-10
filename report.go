@@ -107,7 +107,8 @@ func (r *Reporter) Build(from, to time.Time) string {
 	msgs := r.ops.Sum("bridge", "messages", from, to)
 	pass := r.ops.Sum("bridge", "passthrough", from, to)
 	failed := r.ops.Sum("bridge", "untranslated", from, to)
-	fmt.Fprintf(&b, "СООБЩЕНИЯ\n  Переслано всего: %d\n  Без перевода (эмодзи, ссылки, код): %d\n  Не удалось перевести (ушли как есть): %d\n\n", msgs, pass, failed)
+	local := r.ops.Sum("bridge", "localcopies", from, to)
+	fmt.Fprintf(&b, "СООБЩЕНИЯ\n  Переслано всего: %d\n  Без перевода (эмодзи, ссылки, код): %d\n  Не удалось перевести (ушли как есть): %d\n  Переводов на местный язык (чужие языки): %d\n\n", msgs, pass, failed, local)
 
 	// --- Usage per provider
 	quota := map[string][2]int64{}

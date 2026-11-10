@@ -32,7 +32,7 @@ func NewAzure(key, region string, monthlyLimit int64) *Azure {
 
 func (a *Azure) Name() string { return "azure" }
 
-func (a *Azure) Translate(ctx context.Context, text, _ string, to Lang) (string, error) {
+func (a *Azure) Translate(ctx context.Context, text, _ string, to Lang) (Result, error) {
 	m := mask(text)
 	input := m.render(true) // textType=html keeps our <x i="N"/> placeholders intact
 	raw, _ := json.Marshal([]map[string]string{{"Text": input}})
@@ -40,7 +40,7 @@ func (a *Azure) Translate(ctx context.Context, text, _ string, to Lang) (string,
 	q := url.Values{"api-version": {"3.0"}, "to": {to.ISO}, "textType": {"html"}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.endpoint+"?"+q.Encode(), bytes.NewReader(raw))
 	if err != nil {
-		return "", err
+		return Result{}, err
 	}
 	req.Header.Set("Ocp-Apim-Subscription-Key", a.key)
 	if a.region != "" && a.region != "global" {
@@ -50,7 +50,7 @@ func (a *Azure) Translate(ctx context.Context, text, _ string, to Lang) (string,
 
 	resp, err := a.http.Do(req)
 	if err != nil {
-		return "", err
+		return Result{}, err
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -66,11 +66,11 @@ func (a *Azure) Translate(ctx context.Context, text, _ string, to Lang) (string,
 		msg := fmt.Sprintf("azure status %d: %s", resp.StatusCode, strings.TrimSpace(e.Error.Message))
 		switch {
 		case e.Error.Code == 403001: // free monthly quota used up
-			return "", &limitError{msg: msg, cooldown: 6 * time.Hour}
+			return Result{}, &limitError{msg: msg, cooldown: 6 * time.Hour}
 		case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
-			return "", &limitError{msg: msg, cooldown: 30 * time.Second}
+			return Result{}, &limitError{msg: msg, cooldown: 30 * time.Second}
 		}
-		return "", fmt.Errorf("%s", msg)
+		return Result{}, fmt.Errorf("%s", msg)
 	}
 
 	var parsed []struct {
@@ -82,12 +82,13 @@ func (a *Azure) Translate(ctx context.Context, text, _ string, to Lang) (string,
 		} `json:"translations"`
 	}
 	if err := json.Unmarshal(data, &parsed); err != nil || len(parsed) == 0 || len(parsed[0].Translations) == 0 {
-		return "", fmt.Errorf("azure: bad response: %s", strings.TrimSpace(string(data)))
+		return Result{}, fmt.Errorf("azure: bad response: %s", strings.TrimSpace(string(data)))
 	}
-	if strings.HasPrefix(parsed[0].Detected.Language, to.ISO) {
-		return text, nil // already in the target language
+	lang := normLang(parsed[0].Detected.Language)
+	if lang == to.ISO {
+		return Result{Text: text, Lang: lang}, nil // already in the target language
 	}
-	return m.restore(parsed[0].Translations[0].Text, true), nil
+	return Result{Text: m.restore(parsed[0].Translations[0].Text, true), Lang: lang}, nil
 }
 
 // Usage reports locally counted characters for the current month (Azure's API

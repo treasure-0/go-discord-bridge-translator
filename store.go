@@ -20,7 +20,8 @@ type Record struct {
 	Author        string   `json:"author"`
 	SourceText    string   `json:"source_text"` // short snippets for reply quotes
 	TargetText    string   `json:"target_text"`
-	ContentHash   string   `json:"content_hash"` // detects real text edits vs embed updates
+	ContentHash   string   `json:"content_hash"`
+	LocalID       string   `json:"local_id,omitempty"` // bot's local-language copy in the source channel // detects real text edits vs embed updates
 }
 
 // Store is a small persistent map of message pairs. A chat bridge only needs
@@ -32,11 +33,12 @@ type Store struct {
 	mu       sync.Mutex
 	bySource map[string]*Record
 	byTarget map[string]string // translated message ID -> source ID
+	byLocal  map[string]string // local copy ID -> source ID
 	dirty    bool
 }
 
 func OpenStore(path string) (*Store, error) {
-	s := &Store{path: path, maxRecords: 20000, bySource: map[string]*Record{}, byTarget: map[string]string{}}
+	s := &Store{path: path, maxRecords: 20000, bySource: map[string]*Record{}, byTarget: map[string]string{}, byLocal: map[string]string{}}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return s, nil
@@ -59,6 +61,9 @@ func (s *Store) index(r *Record) {
 	for _, id := range r.TargetIDs {
 		s.byTarget[id] = r.SourceID
 	}
+	if r.LocalID != "" {
+		s.byLocal[r.LocalID] = r.SourceID
+	}
 }
 
 func (s *Store) unindex(r *Record) {
@@ -66,6 +71,7 @@ func (s *Store) unindex(r *Record) {
 	for _, id := range r.TargetIDs {
 		delete(s.byTarget, id)
 	}
+	delete(s.byLocal, r.LocalID)
 }
 
 // Put adds or replaces a record (a copy is stored).
@@ -98,6 +104,17 @@ func (s *Store) ByTarget(id string) (Record, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	src, ok := s.byTarget[id]
+	if !ok {
+		return Record{}, false
+	}
+	return *s.bySource[src], true
+}
+
+// ByLocal returns the record whose local-language copy has the given ID.
+func (s *Store) ByLocal(id string) (Record, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	src, ok := s.byLocal[id]
 	if !ok {
 		return Record{}, false
 	}

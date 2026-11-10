@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/bwmarrin/discordgo"
 )
@@ -25,7 +26,8 @@ const (
 // Route says where messages from a channel go and into which language.
 type Route struct {
 	Target string
-	Lang   Lang
+	Lang   Lang // language of the target channel
+	Local  Lang // main language of the source channel
 }
 
 // Bridge mirrors messages between paired channels, translating them on the way.
@@ -176,7 +178,8 @@ func (b *Bridge) mirror(m *discordgo.Message) {
 		prefix = forwardedLabel(route.Lang)
 	}
 
-	text, provider := b.translate(content, replyHint(m), route.Lang)
+	res, provider := b.translate(content, replyHint(m), route.Lang)
+	text := res.Text
 	files, links := b.downloadAttachments(atts, stickers)
 
 	body := strings.TrimSpace(strings.Join(append([]string{text}, links...), "\n"))
@@ -224,6 +227,7 @@ func (b *Bridge) mirror(m *discordgo.Message) {
 		SourceText:    snippet(content, snippetLen),
 		TargetText:    snippet(text, snippetLen),
 		ContentHash:   contentHash(m.Content),
+		LocalID:       b.postLocalCopy(m, content, res.Lang, route),
 	})
 	ops.Add("bridge", "messages", 1)
 	switch provider {
@@ -256,14 +260,15 @@ func (b *Bridge) execute(channelID string, hook **discordgo.Webhook, p *discordg
 // translate returns the translated text and which provider produced it.
 // If every provider fails, the original text is posted with a small notice
 // so the conversation isn't lost.
-func (b *Bridge) translate(text, hint string, to Lang) (string, string) {
+func (b *Bridge) translate(text, hint string, to Lang) (Result, string) {
 	if !needsTranslation(text) {
-		return text, "passthrough"
+		return Result{Text: text}, "passthrough"
 	}
-	var out, provider string
+	var out Result
+	var provider string
 	var err error
 	if named, ok := b.tr.(interface {
-		TranslateNamed(context.Context, string, string, Lang) (string, string, error)
+		TranslateNamed(context.Context, string, string, Lang) (Result, string, error)
 	}); ok {
 		out, provider, err = named.TranslateNamed(b.ctx, text, hint, to)
 	} else {
@@ -274,7 +279,7 @@ func (b *Bridge) translate(text, hint string, to Lang) (string, string) {
 		recordError("все переводчики не ответили: %v", err)
 		b.notifier.Alert("all-failed", 15*time.Minute,
 			"🚨 Ни один переводчик не ответил, сообщения пересылаются без перевода. Ошибки: "+truncate(err.Error(), 1500))
-		return text + "\n-# ⚠️ translation unavailable", "none"
+		return Result{Text: text + "\n-# ⚠️ translation unavailable"}, "none"
 	}
 	return out, provider
 }
@@ -301,8 +306,12 @@ func (b *Bridge) replyPrefix(m *discordgo.Message, route Route) string {
 	if m.MessageReference == nil || m.MessageReference.Type != discordgo.MessageReferenceTypeDefault || ref == nil {
 		return ""
 	}
-	// Replying to an original message -> point at its translation.
-	if rec, ok := b.store.BySource(ref.ID); ok && rec.TargetChannel == route.Target {
+	// Replying to an original message (or to the bot's local copy of it) -> point at its translation.
+	refID := ref.ID
+	if rec, ok := b.store.ByLocal(ref.ID); ok {
+		refID = rec.SourceID
+	}
+	if rec, ok := b.store.BySource(refID); ok && rec.TargetChannel == route.Target {
 		return replyQuote(rec.Author, rec.TargetText, messageLink(m.GuildID, rec.TargetChannel, rec.TargetIDs[0]))
 	}
 	// Replying to a translation -> point at the original it came from.
@@ -333,7 +342,8 @@ func (b *Bridge) edit(m *discordgo.Message) {
 	}
 
 	route := b.routes[m.ChannelID]
-	text, _ := b.translate(m.Content, replyHint(m), route.Lang)
+	res, _ := b.translate(m.Content, replyHint(m), route.Lang)
+	text := res.Text
 	chunks := splitMessage(rec.Prefix, text, discordLimit)
 
 	// Keep the same number of messages: merge overflow into the last one,
@@ -364,6 +374,7 @@ func (b *Bridge) edit(m *discordgo.Message) {
 	rec.TargetIDs = kept
 	rec.SourceText = snippet(m.Content, snippetLen)
 	rec.TargetText = snippet(text, snippetLen)
+	rec.LocalID = b.updateLocalCopy(m, rec.LocalID, res.Lang, route)
 	rec.ContentHash = contentHash(m.Content)
 	b.store.Put(rec)
 }
@@ -379,6 +390,11 @@ func (b *Bridge) remove(sourceID string) {
 			if err := b.s.WebhookMessageDelete(hook.ID, hook.Token, id); err != nil {
 				recordError("удаление %s: %v", id, err)
 			}
+		}
+	}
+	if rec.LocalID != "" {
+		if err := b.s.ChannelMessageDelete(rec.SourceChannel, rec.LocalID); err != nil {
+			recordError("удаление локального перевода %s: %v", rec.LocalID, err)
 		}
 	}
 	b.store.Delete(sourceID)
@@ -522,4 +538,74 @@ func (b *Bridge) fetch(url string, limit int) ([]byte, error) {
 		return nil, errors.New("too large")
 	}
 	return data, nil
+}
+
+// ---------------------------------------------------------------------------
+// Local copies for foreign languages
+// ---------------------------------------------------------------------------
+
+// needsLocalCopy: the message is in a language other than the channel's main
+// one and long enough to be worth translating locally ("ok", "gg", "danke" are not).
+func needsLocalCopy(content, lang string, route Route) bool {
+	if lang == "" || lang == "und" || lang == route.Local.ISO {
+		return false
+	}
+	plain := protectedRe.ReplaceAllString(content, " ")
+	letters := 0
+	for _, r := range plain {
+		if unicode.IsLetter(r) {
+			letters++
+		}
+	}
+	return len(strings.Fields(plain)) >= 3 || letters >= 20
+}
+
+func localCopyText(lang string, route Route, translation string) string {
+	head := "🌐 **" + strings.ToUpper(lang) + " → " + strings.ToUpper(route.Local.ISO) + ":** "
+	return truncate(head+translation, discordLimit)
+}
+
+// postLocalCopy replies to a foreign-language message in its own channel with a
+// translation into the channel's main language. The reply comes from the bot
+// itself, so the bridge ignores it and it never crosses to the other channel.
+func (b *Bridge) postLocalCopy(m *discordgo.Message, content, lang string, route Route) string {
+	if !needsLocalCopy(content, lang, route) {
+		return ""
+	}
+	res, provider := b.translate(content, replyHint(m), route.Local)
+	if provider == "none" || provider == "passthrough" {
+		return ""
+	}
+	msg, err := b.s.ChannelMessageSendComplex(m.ChannelID, &discordgo.MessageSend{
+		Content:         localCopyText(lang, route, res.Text),
+		Reference:       &discordgo.MessageReference{MessageID: m.ID, ChannelID: m.ChannelID, GuildID: m.GuildID},
+		AllowedMentions: &discordgo.MessageAllowedMentions{}, // no pings, not even the author
+	})
+	if err != nil {
+		recordError("локальный перевод в канале %s: %v", m.ChannelID, err)
+		return ""
+	}
+	ops.Add("bridge", "localcopies", 1)
+	return msg.ID
+}
+
+// updateLocalCopy keeps the local copy in sync after an edit and returns its ID.
+func (b *Bridge) updateLocalCopy(m *discordgo.Message, localID, lang string, route Route) string {
+	if localID == "" {
+		return b.postLocalCopy(m, m.Content, lang, route)
+	}
+	if !needsLocalCopy(m.Content, lang, route) {
+		if err := b.s.ChannelMessageDelete(m.ChannelID, localID); err != nil {
+			recordError("удаление локального перевода %s: %v", localID, err)
+		}
+		return ""
+	}
+	res, provider := b.translate(m.Content, replyHint(m), route.Local)
+	if provider == "none" {
+		return localID
+	}
+	if _, err := b.s.ChannelMessageEdit(m.ChannelID, localID, localCopyText(lang, route, res.Text)); err != nil {
+		recordError("правка локального перевода %s: %v", localID, err)
+	}
+	return localID
 }

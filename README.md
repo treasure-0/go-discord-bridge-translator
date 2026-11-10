@@ -9,6 +9,10 @@ so the conversation reads naturally on both sides.
 - **Identity mirroring** — translations are posted through a webhook with the author's server nickname and avatar.
 - **AI translation that gets chat language** — an LLM on **Groq** (sub-second responses) translates meaning rather
   than words: abbreviations, gaming/internet slang, memes and swearing of the same strength.
+- **Any language in, both channels understand it** — each channel has a main language (Russian / English). A message
+  in any other language (German, Spanish, …, or the neighbour channel's language) is bridged as usual *and* the bot
+  replies to it in its own channel with a translation into the local language (`🌐 DE → RU: …`). The language is
+  detected by the same LLM call; short messages like "ok"/"gg" are skipped, and the bot's own replies never cross the bridge.
 - **Fault-tolerant** — if the LLM is rate-limited or down, the bot falls back to machine translation:
   **Azure AI Translator** (2M chars/month) → **DeepL** (1M chars in total, reserve) → **Google Gemini** (slow free tier).
   Overloaded or out-of-quota providers are skipped for a cooldown. The order is configurable via `TRANSLATORS`.

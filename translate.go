@@ -33,11 +33,18 @@ var (
 	LangRU = Lang{Name: "Russian", DeepL: "RU", ISO: "ru"}
 )
 
+// Result is a translation plus the detected language of the original
+// (lowercase ISO 639-1 like "de"; "" when unknown, "und" when unclear).
+type Result struct {
+	Text string
+	Lang string
+}
+
 // Translator translates a single chat message. hint is optional surrounding
 // text (e.g. the message being replied to) that helps disambiguate meaning.
 type Translator interface {
 	Name() string
-	Translate(ctx context.Context, text, hint string, to Lang) (string, error)
+	Translate(ctx context.Context, text, hint string, to Lang) (Result, error)
 }
 
 // errRateLimited marks provider errors caused by quotas or overload, so the
@@ -158,13 +165,38 @@ func llmPrompts(m masked, hint string, to Lang) (system, user string) {
 		"Keep the tone and register; translate profanity with an equivalent of the same strength, never censor or soften it. " +
 		"Keep emoji, names and Discord markdown (**bold**, *italic*, ||spoiler||, > quotes, line breaks). " +
 		`Keep every <x i="N"/> tag exactly as written, in the matching position. ` +
-		"Output only the translation, with no quotes, notes or explanations."
+		`Respond with JSON only: {"lang": "<ISO 639-1 code of the original message's language, or \"und\" if unclear>", "translation": "<the translation>"}.`
 	user = m.render(false)
 	if hint != "" {
 		user = "Earlier message, for context only (do not translate or output it):\n" + hint +
 			"\n\nMessage to translate:\n" + user
 	}
 	return system, user
+}
+
+// parseLLM reads the {"lang","translation"} JSON reply. If the model ignored
+// the format, the whole reply is treated as the translation.
+func parseLLM(out string) (text, lang string) {
+	s := strings.TrimSpace(out)
+	s = strings.TrimPrefix(strings.TrimPrefix(s, "```json"), "```")
+	s = strings.TrimSpace(strings.TrimSuffix(s, "```"))
+	var r struct {
+		Lang        string `json:"lang"`
+		Translation string `json:"translation"`
+	}
+	if err := json.Unmarshal([]byte(s), &r); err != nil || r.Translation == "" {
+		return strings.TrimSpace(out), ""
+	}
+	return strings.TrimSpace(r.Translation), normLang(r.Lang)
+}
+
+// normLang turns "DE", "zh-Hans", "pt_BR" into "de", "zh", "pt".
+func normLang(l string) string {
+	l = strings.ToLower(strings.TrimSpace(l))
+	if i := strings.IndexAny(l, "-_"); i > 0 {
+		l = l[:i]
+	}
+	return l
 }
 
 // ---------------------------------------------------------------------------
@@ -189,7 +221,7 @@ func (g *Gemini) Name() string { return "gemini" }
 // Label includes the model, for logs.
 func (g *Gemini) Label() string { return "gemini(" + g.model + ")" }
 
-func (g *Gemini) Translate(ctx context.Context, text, hint string, to Lang) (string, error) {
+func (g *Gemini) Translate(ctx context.Context, text, hint string, to Lang) (Result, error) {
 	m := mask(text)
 	system, prompt := llmPrompts(m, hint, to)
 
@@ -197,6 +229,7 @@ func (g *Gemini) Translate(ctx context.Context, text, hint string, to Lang) (str
 	cfg := &genai.GenerateContentConfig{
 		SystemInstruction: genai.NewContentFromText(system, genai.RoleUser),
 		Temperature:       &temp,
+		ResponseMIMEType:  "application/json",
 		SafetySettings: []*genai.SafetySetting{
 			{Category: genai.HarmCategoryDangerousContent, Threshold: genai.HarmBlockThresholdBlockNone},
 			{Category: genai.HarmCategoryHarassment, Threshold: genai.HarmBlockThresholdBlockNone},
@@ -210,18 +243,19 @@ func (g *Gemini) Translate(ctx context.Context, text, hint string, to Lang) (str
 		var apiErr genai.APIError
 		// 429 = quota, 503 = "model is experiencing high demand" (common on the free tier).
 		if errors.As(err, &apiErr) && (apiErr.Code == http.StatusTooManyRequests || apiErr.Code == http.StatusServiceUnavailable) {
-			return "", &limitError{msg: err.Error(), cooldown: 30 * time.Second}
+			return Result{}, &limitError{msg: err.Error(), cooldown: 30 * time.Second}
 		}
-		return "", err
+		return Result{}, err
 	}
 	if resp.UsageMetadata != nil {
 		ops.Add(g.Name(), "tokens", int64(resp.UsageMetadata.TotalTokenCount))
 	}
 	out := strings.TrimSpace(resp.Text())
 	if out == "" {
-		return "", errors.New("gemini returned an empty response")
+		return Result{}, errors.New("gemini returned an empty response")
 	}
-	return m.restore(out, false), nil
+	text2, lang := parseLLM(out)
+	return Result{Text: m.restore(text2, false), Lang: lang}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -244,7 +278,7 @@ func NewDeepL(key string) *DeepL {
 
 func (d *DeepL) Name() string { return "deepl" }
 
-func (d *DeepL) Translate(ctx context.Context, text, hint string, to Lang) (string, error) {
+func (d *DeepL) Translate(ctx context.Context, text, hint string, to Lang) (Result, error) {
 	m := mask(text)
 	body := map[string]any{
 		"text":                []string{m.render(true)},
@@ -259,25 +293,25 @@ func (d *DeepL) Translate(ctx context.Context, text, hint string, to Lang) (stri
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.endpoint, bytes.NewReader(raw))
 	if err != nil {
-		return "", err
+		return Result{}, err
 	}
 	req.Header.Set("Authorization", "DeepL-Auth-Key "+d.key)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := d.http.Do(req)
 	if err != nil {
-		return "", err
+		return Result{}, err
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 
 	switch {
 	case resp.StatusCode == 456: // monthly character quota used up
-		return "", &limitError{msg: "deepl: monthly quota exceeded", cooldown: time.Hour}
+		return Result{}, &limitError{msg: "deepl: monthly quota exceeded", cooldown: time.Hour}
 	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable:
-		return "", &limitError{msg: fmt.Sprintf("deepl status %d", resp.StatusCode), cooldown: 30 * time.Second}
+		return Result{}, &limitError{msg: fmt.Sprintf("deepl status %d", resp.StatusCode), cooldown: 30 * time.Second}
 	case resp.StatusCode != http.StatusOK:
-		return "", fmt.Errorf("deepl status %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+		return Result{}, fmt.Errorf("deepl status %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
 	}
 
 	var parsed struct {
@@ -287,14 +321,15 @@ func (d *DeepL) Translate(ctx context.Context, text, hint string, to Lang) (stri
 		} `json:"translations"`
 	}
 	if err := json.Unmarshal(data, &parsed); err != nil || len(parsed.Translations) == 0 {
-		return "", fmt.Errorf("deepl: bad response: %s", strings.TrimSpace(string(data)))
+		return Result{}, fmt.Errorf("deepl: bad response: %s", strings.TrimSpace(string(data)))
 	}
 	tr := parsed.Translations[0]
+	lang := normLang(tr.DetectedSourceLanguage)
 	// Already in the target language: keep the author's original wording.
 	if strings.HasPrefix(to.DeepL, tr.DetectedSourceLanguage) {
-		return text, nil
+		return Result{Text: text, Lang: lang}, nil
 	}
-	return m.restore(tr.Text, true), nil
+	return Result{Text: m.restore(tr.Text, true), Lang: lang}, nil
 }
 
 // Usage reports characters used and the plan limit (QuotaReporter).
@@ -361,13 +396,13 @@ func (f *Fallback) Name() string {
 	return strings.Join(names, " -> ")
 }
 
-func (f *Fallback) Translate(ctx context.Context, text, hint string, to Lang) (string, error) {
+func (f *Fallback) Translate(ctx context.Context, text, hint string, to Lang) (Result, error) {
 	out, _, err := f.TranslateNamed(ctx, text, hint, to)
 	return out, err
 }
 
 // TranslateNamed also reports which provider produced the translation.
-func (f *Fallback) TranslateNamed(ctx context.Context, text, hint string, to Lang) (string, string, error) {
+func (f *Fallback) TranslateNamed(ctx context.Context, text, hint string, to Lang) (Result, string, error) {
 	var errs []error
 	for i, t := range f.chain {
 		last := i == len(f.chain)-1
@@ -404,5 +439,5 @@ func (f *Fallback) TranslateNamed(ctx context.Context, text, hint string, to Lan
 		}
 		errs = append(errs, fmt.Errorf("%s: %w", t.Name(), err))
 	}
-	return "", "", errors.Join(errs...)
+	return Result{}, "", errors.Join(errs...)
 }

@@ -165,8 +165,8 @@ func main() {
 	}
 
 	bridge := NewBridge(dg, translator, store, map[string]Route{
-		cfg.ChannelRU:  {Target: cfg.ChannelINT, Lang: LangEN},
-		cfg.ChannelINT: {Target: cfg.ChannelRU, Lang: LangRU},
+		cfg.ChannelRU:  {Target: cfg.ChannelINT, Lang: LangEN, Local: LangRU},
+		cfg.ChannelINT: {Target: cfg.ChannelRU, Lang: LangRU, Local: LangEN},
 	})
 	bridge.notifier = notifier
 	bridge.Register()

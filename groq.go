@@ -33,7 +33,7 @@ func NewGroq(key, model string) *Groq {
 func (g *Groq) Name() string  { return "groq" }
 func (g *Groq) Label() string { return "groq(" + g.model + ")" }
 
-func (g *Groq) Translate(ctx context.Context, text, hint string, to Lang) (string, error) {
+func (g *Groq) Translate(ctx context.Context, text, hint string, to Lang) (Result, error) {
 	m := mask(text)
 	system, user := llmPrompts(m, hint, to)
 	body := map[string]any{
@@ -42,8 +42,9 @@ func (g *Groq) Translate(ctx context.Context, text, hint string, to Lang) (strin
 			{"role": "system", "content": system},
 			{"role": "user", "content": user},
 		},
-		"temperature": 0.2,
-		"max_tokens":  2048,
+		"temperature":     0.2,
+		"response_format": map[string]string{"type": "json_object"},
+		"max_tokens":      2048,
 	}
 	// Reasoning models: keep thinking short and out of the reply.
 	switch {
@@ -57,14 +58,14 @@ func (g *Groq) Translate(ctx context.Context, text, hint string, to Lang) (strin
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, g.endpoint, bytes.NewReader(raw))
 	if err != nil {
-		return "", err
+		return Result{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+g.key)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := g.http.Do(req)
 	if err != nil {
-		return "", err
+		return Result{}, err
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -82,9 +83,9 @@ func (g *Groq) Translate(ctx context.Context, text, hint string, to Lang) (strin
 			if s, err := strconv.ParseFloat(resp.Header.Get("Retry-After"), 64); err == nil && s > 0 {
 				cd = time.Duration(s*float64(time.Second)) + time.Second
 			}
-			return "", &limitError{msg: msg, cooldown: cd}
+			return Result{}, &limitError{msg: msg, cooldown: cd}
 		}
-		return "", fmt.Errorf("%s", msg)
+		return Result{}, fmt.Errorf("%s", msg)
 	}
 
 	var parsed struct {
@@ -98,12 +99,13 @@ func (g *Groq) Translate(ctx context.Context, text, hint string, to Lang) (strin
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(data, &parsed); err != nil || len(parsed.Choices) == 0 {
-		return "", fmt.Errorf("groq: bad response: %s", strings.TrimSpace(string(data)))
+		return Result{}, fmt.Errorf("groq: bad response: %s", strings.TrimSpace(string(data)))
 	}
 	ops.Add(g.Name(), "tokens", parsed.Usage.TotalTokens)
 	out := strings.TrimSpace(parsed.Choices[0].Message.Content)
 	if out == "" {
-		return "", fmt.Errorf("groq returned an empty response")
+		return Result{}, fmt.Errorf("groq returned an empty response")
 	}
-	return m.restore(out, false), nil
+	text2, lang := parseLLM(out)
+	return Result{Text: m.restore(text2, false), Lang: lang}, nil
 }
