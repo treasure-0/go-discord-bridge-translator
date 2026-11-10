@@ -24,11 +24,12 @@ import (
 type Lang struct {
 	Name  string // human-readable name used in the LLM prompt
 	DeepL string // DeepL target_lang code
+	ISO   string // ISO 639-1 code (Azure)
 }
 
 var (
-	LangEN = Lang{Name: "English", DeepL: "EN-US"}
-	LangRU = Lang{Name: "Russian", DeepL: "RU"}
+	LangEN = Lang{Name: "English", DeepL: "EN-US", ISO: "en"}
+	LangRU = Lang{Name: "Russian", DeepL: "RU", ISO: "ru"}
 )
 
 // Translator translates a single chat message. hint is optional surrounding
@@ -275,6 +276,37 @@ func (d *DeepL) Translate(ctx context.Context, text, hint string, to Lang) (stri
 	return m.restore(tr.Text, true), nil
 }
 
+// Usage reports characters used and the plan limit (QuotaReporter).
+func (d *DeepL) Usage(ctx context.Context) (used, limit int64, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSuffix(d.endpoint, "/translate")+"/usage", nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	req.Header.Set("Authorization", "DeepL-Auth-Key "+d.key)
+	resp, err := d.http.Do(req)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, 0, fmt.Errorf("deepl usage: status %d", resp.StatusCode)
+	}
+	var u struct {
+		Count int64 `json:"character_count"`
+		Limit int64 `json:"character_limit"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&u); err != nil {
+		return 0, 0, err
+	}
+	return u.Count, u.Limit, nil
+}
+
+// QuotaReporter is implemented by providers that can tell how much quota is left.
+type QuotaReporter interface {
+	Name() string
+	Usage(ctx context.Context) (used, limit int64, err error)
+}
+
 // ---------------------------------------------------------------------------
 // Fallback chain
 // ---------------------------------------------------------------------------
@@ -288,6 +320,9 @@ type Fallback struct {
 
 	mu        sync.Mutex
 	skipUntil map[string]time.Time
+
+	// OnLimit is called when a provider is put on cooldown (optional).
+	OnLimit func(provider string, cooldown time.Duration, err error)
 }
 
 func NewFallback(chain ...Translator) *Fallback {
@@ -335,6 +370,9 @@ func (f *Fallback) TranslateNamed(ctx context.Context, text, hint string, to Lan
 			f.skipUntil[t.Name()] = time.Now().Add(cd)
 			f.mu.Unlock()
 			log.Printf("%s unavailable, skipping it for %s: %v", t.Name(), cd, err)
+			if f.OnLimit != nil {
+				f.OnLimit(t.Name(), cd, err)
+			}
 		}
 		errs = append(errs, fmt.Errorf("%s: %w", t.Name(), err))
 	}

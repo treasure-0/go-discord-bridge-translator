@@ -45,6 +45,8 @@ type Bridge struct {
 
 	hooksMu sync.Mutex
 	hooks   map[string]*discordgo.Webhook // target channel -> webhook
+
+	notifier *Notifier // optional alerts to the owner
 }
 
 func NewBridge(s *discordgo.Session, tr Translator, store *Store, routes map[string]Route) *Bridge {
@@ -263,6 +265,8 @@ func (b *Bridge) translate(text, hint string, to Lang) (string, string) {
 	}
 	if err != nil {
 		log.Printf("translation failed: %v", err)
+		b.notifier.Alert("all-failed", 15*time.Minute,
+			"🚨 Ни один переводчик не ответил, сообщения пересылаются без перевода. Ошибки: "+truncate(err.Error(), 1500))
 		return text + "\n-# ⚠️ translation unavailable", "none"
 	}
 	return out, provider
@@ -395,6 +399,8 @@ func (b *Bridge) webhook(channelID string) (*discordgo.Webhook, error) {
 	}
 	h, err := b.s.WebhookCreate(channelID, bridgeHookName, "")
 	if err != nil {
+		b.notifier.Alert("webhook-"+channelID, time.Hour,
+			"🚨 Не получается создать вебхук в канале <#"+channelID+">. Проверь, что у бота есть право Manage Webhooks.")
 		return nil, fmt.Errorf("create webhook: %w", err)
 	}
 	b.hooks[channelID] = h

@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -19,30 +21,41 @@ type Config struct {
 	DiscordToken string
 	ChannelRU    string
 	ChannelINT   string
+
+	Translators  []string // order of preference
+	AzureKey     string
+	AzureRegion  string
+	AzureLimit   int64 // free monthly characters
+	DeepLKey     string
 	GeminiKey    string
 	GeminiModel  string
-	DeepLKey     string
-	Translators  []string // order of preference
-	DataDir      string
+	QuotaWarnPct int64
+
+	AlertUserID    string
+	AlertChannelID string
+	DataDir        string
 }
 
 func loadConfig() Config {
 	_ = godotenv.Load()
 	cfg := Config{
-		DiscordToken: os.Getenv("DISCORD_TOKEN"),
-		ChannelRU:    os.Getenv("CHANNEL_RU"),
-		ChannelINT:   os.Getenv("CHANNEL_INT"),
-		GeminiKey:    os.Getenv("GEMINI_API_KEY"),
-		GeminiModel:  envOr("GEMINI_MODEL", "gemini-3.1-flash-lite"),
-		DeepLKey:     os.Getenv("DEEPL_API_KEY"),
-		DataDir:      envOr("DATA_DIR", "data"),
-		Translators:  strings.Split(strings.ReplaceAll(envOr("TRANSLATORS", "deepl,gemini"), " ", ""), ","),
+		DiscordToken:   os.Getenv("DISCORD_TOKEN"),
+		ChannelRU:      os.Getenv("CHANNEL_RU"),
+		ChannelINT:     os.Getenv("CHANNEL_INT"),
+		Translators:    strings.Split(strings.ReplaceAll(envOr("TRANSLATORS", "azure,deepl,gemini"), " ", ""), ","),
+		AzureKey:       os.Getenv("AZURE_TRANSLATOR_KEY"),
+		AzureRegion:    envOr("AZURE_TRANSLATOR_REGION", "global"),
+		AzureLimit:     envInt("AZURE_MONTHLY_LIMIT", 2_000_000),
+		DeepLKey:       os.Getenv("DEEPL_API_KEY"),
+		GeminiKey:      os.Getenv("GEMINI_API_KEY"),
+		GeminiModel:    envOr("GEMINI_MODEL", "gemini-3.1-flash-lite"),
+		QuotaWarnPct:   envInt("QUOTA_ALERT_PERCENT", 15),
+		AlertUserID:    os.Getenv("ALERT_USER_ID"),
+		AlertChannelID: os.Getenv("ALERT_CHANNEL_ID"),
+		DataDir:        envOr("DATA_DIR", "data"),
 	}
 	if cfg.DiscordToken == "" || cfg.ChannelRU == "" || cfg.ChannelINT == "" {
 		log.Fatal("config: DISCORD_TOKEN, CHANNEL_RU and CHANNEL_INT are required")
-	}
-	if cfg.GeminiKey == "" && cfg.DeepLKey == "" {
-		log.Fatal("config: set at least one of GEMINI_API_KEY or DEEPL_API_KEY")
 	}
 	return cfg
 }
@@ -54,20 +67,61 @@ func envOr(key, def string) string {
 	return def
 }
 
+func envInt(key string, def int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		n, err := strconv.ParseInt(strings.ReplaceAll(v, "_", ""), 10, 64)
+		if err != nil {
+			log.Fatalf("config: %s must be a number", key)
+		}
+		return n
+	}
+	return def
+}
+
 func main() {
 	cfg := loadConfig()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Translators in order of preference (TRANSLATORS, default "deepl,gemini"):
-	// DeepL is fast and reliable; Gemini is better with slang but slow on the free tier.
+	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+		log.Fatalf("data dir: %v", err)
+	}
+	store, err := OpenStore(filepath.Join(cfg.DataDir, "messages.json"))
+	if err != nil {
+		log.Fatalf("store: %v", err)
+	}
+	usage, err := OpenUsageCounter(filepath.Join(cfg.DataDir, "usage.json"))
+	if err != nil {
+		log.Fatalf("usage counter: %v", err)
+	}
+
+	dg, err := discordgo.New("Bot " + cfg.DiscordToken)
+	if err != nil {
+		log.Fatalf("discord: %v", err)
+	}
+	// MessageContent is a privileged intent: it must also be enabled in the
+	// Developer Portal (Bot -> Privileged Gateway Intents), otherwise message text arrives empty.
+	dg.Identify.Intents = discordgo.IntentsGuildMessages | discordgo.IntentsGuildWebhooks | discordgo.IntentMessageContent
+	notifier := NewNotifier(dg, cfg.AlertUserID, cfg.AlertChannelID)
+
+	// Translators in order of preference (TRANSLATORS, default "azure,deepl,gemini").
+	// Providers without an API key are skipped.
 	var chain []Translator
+	var quotas []QuotaReporter
 	for _, name := range cfg.Translators {
 		switch name {
+		case "azure":
+			if cfg.AzureKey != "" {
+				a := NewAzure(cfg.AzureKey, cfg.AzureRegion, cfg.AzureLimit, usage)
+				chain = append(chain, a)
+				quotas = append(quotas, a)
+			}
 		case "deepl":
 			if cfg.DeepLKey != "" {
-				chain = append(chain, NewDeepL(cfg.DeepLKey))
+				d := NewDeepL(cfg.DeepLKey)
+				chain = append(chain, d)
+				quotas = append(quotas, d)
 			}
 		case "gemini":
 			if cfg.GeminiKey != "" {
@@ -82,38 +136,31 @@ func main() {
 		}
 	}
 	if len(chain) == 0 {
-		log.Fatal("config: no translator is configured (check TRANSLATORS and API keys)")
+		log.Fatal("config: no translator is configured (set an API key for at least one of TRANSLATORS)")
 	}
 	translator := NewFallback(chain...)
-
-	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
-		log.Fatalf("data dir: %v", err)
+	translator.OnLimit = func(provider string, cd time.Duration, err error) {
+		notifier.Alert("limit-"+provider, time.Hour, fmt.Sprintf(
+			"⚠️ Переводчик **%s** временно недоступен (%v). Бот на %s переключился на запасной.",
+			provider, err, cd.Round(time.Second)))
 	}
-	store, err := OpenStore(filepath.Join(cfg.DataDir, "messages.json"))
-	if err != nil {
-		log.Fatalf("store: %v", err)
-	}
-
-	dg, err := discordgo.New("Bot " + cfg.DiscordToken)
-	if err != nil {
-		log.Fatalf("discord: %v", err)
-	}
-	// MessageContent is a privileged intent: it must also be enabled in the
-	// Developer Portal (Bot -> Privileged Gateway Intents), otherwise message text arrives empty.
-	dg.Identify.Intents = discordgo.IntentsGuildMessages | discordgo.IntentsGuildWebhooks | discordgo.IntentMessageContent
 
 	bridge := NewBridge(dg, translator, store, map[string]Route{
 		cfg.ChannelRU:  {Target: cfg.ChannelINT, Lang: LangEN},
 		cfg.ChannelINT: {Target: cfg.ChannelRU, Lang: LangRU},
 	})
+	bridge.notifier = notifier
 	bridge.Register()
 
 	if err := dg.Open(); err != nil {
 		log.Fatalf("discord connect: %v", err)
 	}
 	log.Printf("bridge is live (translators: %s)", translator.Name())
+	notifier.Alert("startup", 10*time.Minute, "✅ Бот-переводчик запущен. Переводчики по порядку: "+translator.Name())
 
-	// Persist the message map periodically.
+	go notifier.WatchQuotas(ctx, quotas, cfg.QuotaWarnPct, 30*time.Minute)
+
+	// Persist state periodically.
 	go func() {
 		t := time.NewTicker(10 * time.Second)
 		defer t.Stop()
@@ -125,6 +172,9 @@ func main() {
 				if err := store.Flush(); err != nil {
 					log.Printf("store flush: %v", err)
 				}
+				if err := usage.Flush(); err != nil {
+					log.Printf("usage flush: %v", err)
+				}
 			}
 		}
 	}()
@@ -133,7 +183,6 @@ func main() {
 	log.Println("shutting down...")
 	bridge.Close()
 	_ = dg.Close()
-	if err := store.Flush(); err != nil {
-		log.Printf("store flush: %v", err)
-	}
+	_ = store.Flush()
+	_ = usage.Flush()
 }

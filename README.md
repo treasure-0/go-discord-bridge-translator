@@ -7,9 +7,11 @@ so the conversation reads naturally on both sides.
 ## Features
 
 - **Identity mirroring** — translations are posted through a webhook with the author's server nickname and avatar.
-- **Fast, fault-tolerant translation** — **DeepL API Free** answers in a fraction of a second; if it is down or its
-  monthly quota is used up, the bot switches to **Google Gemini** (Flash-Lite, good with slang) automatically.
-  Overloaded or rate-limited providers are skipped for a cooldown. The order is configurable via `TRANSLATORS`.
+- **Fast, fault-tolerant translation** — a chain of free providers: **Azure AI Translator** (2M chars/month, renews
+  monthly) → **DeepL** (1M chars in total, kept as reserve) → **Google Gemini** (good with slang, slow on the free tier).
+  Overloaded or out-of-quota providers are skipped for a cooldown. The order is configurable via `TRANSLATORS`.
+- **Owner alerts** — a DM and/or admin-channel message when a quota runs low, a provider goes down, every translator
+  fails, or the bot restarts.
 - **Replies** — webhooks can't create native Discord replies, so a translated reply starts with a quote line
   (`↪ Name: preview`) that links to the counterpart of the replied-to message in the other channel.
 - **Attachments** — files are re-uploaded (Discord CDN links expire); files over the upload limit are posted as links.
@@ -24,7 +26,7 @@ so the conversation reads naturally on both sides.
 ## How it works
 
 ```
-#russian ──MessageCreate──▶ queue ──▶ DeepL ─(fail/quota)─▶ Gemini ──▶ webhook (author name + avatar) ──▶ #international
+#russian ──MessageCreate──▶ queue ──▶ Azure ─▶ DeepL ─▶ Gemini (first that answers) ──▶ webhook (author name + avatar) ──▶ #international
 #international ─────────────────────────── same pipeline, translated to Russian ──────────────────────▶ #russian
 ```
 
@@ -36,6 +38,8 @@ edits and deletions.
 | `main.go` | config, startup, graceful shutdown |
 | `bridge.go` | Discord events, webhooks, replies, attachments, edits/deletes |
 | `translate.go` | Gemini and DeepL clients, fallback chain, protection of Discord syntax |
+| `azure.go` | Azure AI Translator client |
+| `notify.go` | owner alerts, quota monitoring, monthly usage counter |
 | `store.go` | persistent original ↔ translation map |
 | `text.go` | message splitting, previews, helpers |
 | `deploy/` | systemd unit and server install script |
@@ -51,10 +55,11 @@ edits and deletions.
 
 ### 2. API keys (free tiers are enough for a community server)
 
+- Azure AI Translator (free tier F0): create a *Translator* resource in the Azure portal → *Keys and Endpoint*
+- DeepL API Developer (key ends with `:fx`): <https://www.deepl.com/pro-api>
 - Gemini: <https://aistudio.google.com/apikey>
-- DeepL API Free (key ends with `:fx`): <https://www.deepl.com/pro-api>
 
-One of them is enough; with both you get the fallback.
+One of them is enough; with more you get automatic fallback.
 
 ### 3. Run locally
 

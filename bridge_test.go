@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -208,5 +211,56 @@ func TestFallbackUsesProviderCooldown(t *testing.T) {
 	}
 	if !errors.Is(&limitError{}, errRateLimited) {
 		t.Fatal("limitError must match errRateLimited")
+	}
+}
+
+func TestUsageCounterAndHumanInt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "u.json")
+	c, _ := OpenUsageCounter(path)
+	c.Add("azure", 1500)
+	c.Add("azure", 500)
+	if err := c.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	c2, err := OpenUsageCounter(path)
+	if err != nil || c2.ThisMonth("azure") != 2000 {
+		t.Fatalf("reload: %v %d", err, c2.ThisMonth("azure"))
+	}
+	if got := humanInt(2000000); got != "2 000 000" {
+		t.Fatalf("humanInt: %q", got)
+	}
+	var n *Notifier
+	n.Alert("x", time.Minute, "nil notifier must be a no-op")
+}
+
+func TestAzureTranslateAndQuota(t *testing.T) {
+	var gotRegion string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRegion = r.Header.Get("Ocp-Apim-Subscription-Region")
+		if r.URL.Query().Get("to") == "ru" {
+			w.WriteHeader(http.StatusForbidden)
+			w.Write([]byte(`{"error":{"code":403001,"message":"free quota exceeded"}}`))
+			return
+		}
+		var body []map[string]string
+		json.NewDecoder(r.Body).Decode(&body)
+		out := strings.Replace(body[0]["Text"], "привет", "hello", 1)
+		json.NewEncoder(w).Encode([]map[string]any{{"detectedLanguage": map[string]any{"language": "ru"}, "translations": []map[string]string{{"text": out}}}})
+	}))
+	defer srv.Close()
+	c, _ := OpenUsageCounter(filepath.Join(t.TempDir(), "u.json"))
+	a := NewAzure("k", "westeurope", 100, c)
+	a.endpoint = srv.URL
+	out, err := a.Translate(context.Background(), "привет <@1> https://x.y/?a=1&b=2", "", LangEN)
+	if err != nil || out != "hello <@1> https://x.y/?a=1&b=2" {
+		t.Fatalf("got %q %v", out, err)
+	}
+	if gotRegion != "westeurope" || c.ThisMonth("azure") == 0 {
+		t.Fatalf("region %q, usage %d", gotRegion, c.ThisMonth("azure"))
+	}
+	_, err = a.Translate(context.Background(), "hi", "", LangRU)
+	var le *limitError
+	if !errors.As(err, &le) || le.cooldown < time.Hour {
+		t.Fatalf("expected long cooldown on quota error, got %v", err)
 	}
 }
