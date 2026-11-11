@@ -1,0 +1,26 @@
+[Unit]
+Description=Discord Bridge Translator bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=translator
+Group=translator
+EnvironmentFile=/etc/discord-translator.env
+Environment=DATA_DIR=/var/lib/discord-translator
+StateDirectory=discord-translator
+WorkingDirectory=/var/lib/discord-translator
+ExecStart=/opt/discord-translator/bin/discord-translator
+Restart=always
+RestartSec=5
+
+# Hardening: the bot only needs network access and its data directory.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/discord-translator
+
+[Install]
+WantedBy=multi-user.target

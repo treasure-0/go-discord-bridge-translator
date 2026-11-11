@@ -30,3 +30,8 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Bot runtime data and local builds
+/data/
+/discord-translator
+/bot
