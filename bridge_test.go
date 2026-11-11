@@ -405,22 +405,43 @@ func TestReplyToLocalCopyPointsAtTranslation(t *testing.T) {
 	}
 }
 
-func TestConnMonitorSeparatesRoutineReconnects(t *testing.T) {
+func TestConnMonitorJournalsDisconnects(t *testing.T) {
 	ops, _ = OpenOps(filepath.Join(t.TempDir(), "ops.json"))
 	defer func() { ops = nil }()
 	c := NewConnMonitor(nil, time.Minute)
 	t0 := time.Now()
+	// Routine: Discord sends Op 7, the library resumes in 3 s.
+	c.libraryLog(t0, "Closing and reconnecting in response to Op7")
 	c.down(t0)
-	c.up(t0.Add(3 * time.Second)) // routine
-	c.down(t0.Add(time.Hour))
-	c.up(t0.Add(time.Hour + 5*time.Minute)) // real outage
+	c.libraryLog(t0.Add(time.Second), "sending resume packet to gateway")
+	c.up(t0.Add(3 * time.Second))
+	// Outage: socket dies, reconnect fails, new session after 5 min.
+	t1 := t0.Add(time.Hour)
+	c.libraryLog(t1, "error reading from gateway wss://gateway.discord.gg websocket, websocket: close 1006 (abnormal closure): unexpected EOF")
+	c.down(t1)
+	c.libraryLog(t1.Add(time.Minute), "error reconnecting to gateway, dial tcp: lookup gateway.discord.gg: i/o timeout")
+	c.up(t1.Add(5 * time.Minute))
+
 	from, to := t0.Add(-time.Hour), t0.Add(3*time.Hour)
 	if r, o := ops.Sum("discord", "reconnects", from, to), ops.Sum("discord", "outages", from, to); r != 2 || o != 1 {
 		t.Fatalf("reconnects=%d outages=%d", r, o)
 	}
 	evs := ops.EventsBetween(from, to)
-	if len(evs) != 1 || !strings.Contains(evs[0].Text, "5 мин") {
+	if len(evs) != 2 {
 		t.Fatalf("events: %+v", evs)
+	}
+	if !strings.Contains(evs[0].Reason, "Op 7") || !strings.Contains(evs[0].Text, "resume") {
+		t.Fatalf("routine: %+v", evs[0])
+	}
+	if !strings.Contains(evs[1].Reason, "1006") || !strings.Contains(evs[1].Text, "новая сессия") || !strings.Contains(evs[1].Text, "i/o timeout") {
+		t.Fatalf("outage: %+v", evs[1])
+	}
+	r, _ := NewReporter(nil, ops, nil, nil, "Europe/Berlin", "09:00")
+	txt := r.Build(from, to)
+	for _, want := range []string{"Отключений: 2 (из них дольше минуты: 1)", "Отвал:", "восстановление:", "перерыв 5 мин 0 с", "ОБРЫВ", "Причина: Discord закрыл соединение, код 1006"} {
+		if !strings.Contains(txt, want) {
+			t.Fatalf("report misses %q:\n%s", want, txt)
+		}
 	}
 	if s := serverSnapshot(); !strings.Contains(s, "Память") {
 		t.Fatalf("snapshot: %q", s)

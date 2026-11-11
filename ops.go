@@ -53,6 +53,9 @@ type Event struct {
 	Time time.Time `json:"t"`
 	Kind string    `json:"k"`
 	Text string    `json:"x"`
+	// Disconnect details.
+	End    time.Time `json:"e,omitempty"`
+	Reason string    `json:"r,omitempty"`
 }
 
 const (
@@ -142,6 +145,20 @@ func (o *Ops) Record(kind, text string) {
 	}
 	o.mu.Lock()
 	o.addEvent(time.Now(), kind, text)
+	o.mu.Unlock()
+}
+
+// RecordDisconnect journals a Discord gateway disconnect (nil-safe).
+func (o *Ops) RecordDisconnect(from, to time.Time, reason, recovery string) {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	o.state.Events = append(o.state.Events, Event{Time: from, End: to, Kind: EvDisconnect, Reason: reason, Text: recovery})
+	if len(o.state.Events) > maxEvents {
+		o.state.Events = o.state.Events[len(o.state.Events)-maxEvents:]
+	}
+	o.dirty = true
 	o.mu.Unlock()
 }
 

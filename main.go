@@ -172,8 +172,6 @@ func main() {
 	bridge.Register()
 	// Routine reconnects are only counted; outages over a minute are journaled and alerted.
 	NewConnMonitor(notifier, time.Minute).Register(dg)
-	// Library warnings (gateway close codes, failed heartbeats) go to the journal for diagnosis.
-	dg.LogLevel = discordgo.LogWarning
 
 	if err := dg.Open(); err != nil {
 		log.Fatalf("discord connect: %v", err)

@@ -149,13 +149,36 @@ func (r *Reporter) Build(from, to time.Time) string {
 	for _, e := range events {
 		if e.Kind == EvError {
 			errs = append(errs, e)
-		} else {
+		} else if e.Kind != EvDisconnect { // disconnects have their own section
 			incidents = append(incidents, e)
 		}
 	}
-	fmt.Fprintf(&b, "СВЯЗЬ С DISCORD\n  Плановых переподключений (норма, секунды): %d\n  Обрывов дольше минуты: %d\n\n",
-		r.ops.Sum("discord", "reconnects", from, to)-r.ops.Sum("discord", "outages", from, to),
-		r.ops.Sum("discord", "outages", from, to))
+	// --- Discord connection: every disconnect with times and reason
+	var discs []Event
+	for _, e := range r.ops.EventsBetween(from, to) {
+		if e.Kind == EvDisconnect {
+			discs = append(discs, e)
+		}
+	}
+	outages := r.ops.Sum("discord", "outages", from, to)
+	fmt.Fprintf(&b, "СВЯЗЬ С DISCORD\n  Отключений: %d (из них дольше минуты: %d)\n", len(discs), outages)
+	if len(discs) == 0 {
+		b.WriteString("  Связь не прерывалась.\n")
+	}
+	ts := func(t time.Time) string { return t.In(r.loc).Format("02.01 15:04:05") }
+	for i, e := range discs {
+		if e.End.IsZero() { // old-format entry (before detailed logging)
+			fmt.Fprintf(&b, "  %d) %s — %s\n", i+1, ts(e.Time), e.Text)
+			continue
+		}
+		mark := ""
+		if e.End.Sub(e.Time) >= time.Minute {
+			mark = " ⚠️ ОБРЫВ"
+		}
+		fmt.Fprintf(&b, "  %d) Отвал: %s → восстановление: %s (перерыв %s)%s\n     Причина: %s\n     Восстановление: %s\n",
+			i+1, ts(e.Time), ts(e.End), humanDuration(e.End.Sub(e.Time)), mark, e.Reason, e.Text)
+	}
+	b.WriteString("\n")
 	fmt.Fprintf(&b, "СЕРВЕР\n%s  Минут с перегрузкой CPU за период: %d\n  Минут, когда облако отбирало CPU (steal > 50%%): %d\n\n",
 		serverSnapshot(), r.ops.Sum("server", "overload_minutes", from, to), r.ops.Sum("server", "steal_minutes", from, to))
 	b.WriteString("ПАДЕНИЯ И ПЕРЕЗАПУСКИ\n")
