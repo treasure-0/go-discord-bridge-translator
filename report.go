@@ -153,6 +153,11 @@ func (r *Reporter) Build(from, to time.Time) string {
 			incidents = append(incidents, e)
 		}
 	}
+	fmt.Fprintf(&b, "СВЯЗЬ С DISCORD\n  Плановых переподключений (норма, секунды): %d\n  Обрывов дольше минуты: %d\n\n",
+		r.ops.Sum("discord", "reconnects", from, to)-r.ops.Sum("discord", "outages", from, to),
+		r.ops.Sum("discord", "outages", from, to))
+	fmt.Fprintf(&b, "СЕРВЕР\n%s  Минут с перегрузкой CPU за период: %d\n  Минут, когда облако отбирало CPU (steal > 50%%): %d\n\n",
+		serverSnapshot(), r.ops.Sum("server", "overload_minutes", from, to), r.ops.Sum("server", "steal_minutes", from, to))
 	b.WriteString("ПАДЕНИЯ И ПЕРЕЗАПУСКИ\n")
 	if len(incidents) == 0 {
 		b.WriteString("  Не было.\n")

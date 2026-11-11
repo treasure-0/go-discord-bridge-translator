@@ -404,3 +404,25 @@ func TestReplyToLocalCopyPointsAtTranslation(t *testing.T) {
 		t.Fatalf("reply to local copy: %q", got)
 	}
 }
+
+func TestConnMonitorSeparatesRoutineReconnects(t *testing.T) {
+	ops, _ = OpenOps(filepath.Join(t.TempDir(), "ops.json"))
+	defer func() { ops = nil }()
+	c := NewConnMonitor(nil, time.Minute)
+	t0 := time.Now()
+	c.down(t0)
+	c.up(t0.Add(3 * time.Second)) // routine
+	c.down(t0.Add(time.Hour))
+	c.up(t0.Add(time.Hour + 5*time.Minute)) // real outage
+	from, to := t0.Add(-time.Hour), t0.Add(3*time.Hour)
+	if r, o := ops.Sum("discord", "reconnects", from, to), ops.Sum("discord", "outages", from, to); r != 2 || o != 1 {
+		t.Fatalf("reconnects=%d outages=%d", r, o)
+	}
+	evs := ops.EventsBetween(from, to)
+	if len(evs) != 1 || !strings.Contains(evs[0].Text, "5 мин") {
+		t.Fatalf("events: %+v", evs)
+	}
+	if s := serverSnapshot(); !strings.Contains(s, "Память") {
+		t.Fatalf("snapshot: %q", s)
+	}
+}

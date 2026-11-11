@@ -170,9 +170,10 @@ func main() {
 	})
 	bridge.notifier = notifier
 	bridge.Register()
-	dg.AddHandler(func(_ *discordgo.Session, _ *discordgo.Disconnect) {
-		ops.Record(EvDisconnect, "Потеряно соединение с Discord (бот переподключается автоматически)")
-	})
+	// Routine reconnects are only counted; outages over a minute are journaled and alerted.
+	NewConnMonitor(notifier, time.Minute).Register(dg)
+	// Library warnings (gateway close codes, failed heartbeats) go to the journal for diagnosis.
+	dg.LogLevel = discordgo.LogWarning
 
 	if err := dg.Open(); err != nil {
 		log.Fatalf("discord connect: %v", err)
@@ -185,6 +186,7 @@ func main() {
 	}
 
 	go notifier.WatchQuotas(ctx, quotas, cfg.QuotaWarnPct, 30*time.Minute)
+	go WatchServer(ctx)
 	if notifier.Enabled() {
 		rep, err := NewReporter(notifier, ops, quotas, names, cfg.ReportTZ, cfg.ReportTime)
 		if err != nil {
