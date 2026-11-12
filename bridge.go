@@ -227,7 +227,7 @@ func (b *Bridge) mirror(m *discordgo.Message) {
 		SourceText:    snippet(content, snippetLen),
 		TargetText:    snippet(text, snippetLen),
 		ContentHash:   contentHash(m.Content),
-		LocalID:       b.postLocalCopy(m, content, res.Lang, route),
+		LocalID:       b.postLocalCopy(m, content, res, route),
 	})
 	ops.Add("bridge", "messages", 1)
 	switch provider {
@@ -374,7 +374,7 @@ func (b *Bridge) edit(m *discordgo.Message) {
 	rec.TargetIDs = kept
 	rec.SourceText = snippet(m.Content, snippetLen)
 	rec.TargetText = snippet(text, snippetLen)
-	rec.LocalID = b.updateLocalCopy(m, rec.LocalID, res.Lang, route)
+	rec.LocalID = b.updateLocalCopy(m, rec.LocalID, res, route)
 	rec.ContentHash = contentHash(m.Content)
 	b.store.Put(rec)
 }
@@ -546,9 +546,26 @@ func (b *Bridge) fetch(url string, limit int) ([]byte, error) {
 
 // needsLocalCopy: the message is in a language other than the channel's main
 // one and long enough to be worth translating locally ("ok", "gg", "danke" are not).
-func needsLocalCopy(content, lang string, route Route) bool {
-	if lang == "" || lang == "und" || lang == route.Local.ISO {
-		return false
+// It returns the foreign language to show in the header.
+//
+// With an LLM translator the decision uses its language list (so mixed messages
+// like "What Теперь должно работать" are caught whatever language dominates) and
+// its "trivial" flag (ok, gg, lol are skipped, "Hablas español" is not). Machine
+// translators only report the main language, so a simple length rule is used.
+func needsLocalCopy(content string, res Result, route Route) (bool, string) {
+	if res.Trivial {
+		return false, ""
+	}
+	if len(res.Langs) > 0 {
+		for _, l := range res.Langs {
+			if l != route.Local.ISO {
+				return true, l
+			}
+		}
+		return false, ""
+	}
+	if res.Lang == "" || res.Lang == "und" || res.Lang == route.Local.ISO {
+		return false, ""
 	}
 	plain := protectedRe.ReplaceAllString(content, " ")
 	letters := 0
@@ -557,7 +574,10 @@ func needsLocalCopy(content, lang string, route Route) bool {
 			letters++
 		}
 	}
-	return len(strings.Fields(plain)) >= 3 || letters >= 20
+	if len(strings.Fields(plain)) < 2 || letters < 8 {
+		return false, ""
+	}
+	return true, res.Lang
 }
 
 func localCopyText(lang string, route Route, translation string) string {
@@ -568,8 +588,9 @@ func localCopyText(lang string, route Route, translation string) string {
 // postLocalCopy replies to a foreign-language message in its own channel with a
 // translation into the channel's main language. The reply comes from the bot
 // itself, so the bridge ignores it and it never crosses to the other channel.
-func (b *Bridge) postLocalCopy(m *discordgo.Message, content, lang string, route Route) string {
-	if !needsLocalCopy(content, lang, route) {
+func (b *Bridge) postLocalCopy(m *discordgo.Message, content string, bridged Result, route Route) string {
+	need, lang := needsLocalCopy(content, bridged, route)
+	if !need {
 		return ""
 	}
 	res, provider := b.translate(content, replyHint(m), route.Local)
@@ -590,11 +611,12 @@ func (b *Bridge) postLocalCopy(m *discordgo.Message, content, lang string, route
 }
 
 // updateLocalCopy keeps the local copy in sync after an edit and returns its ID.
-func (b *Bridge) updateLocalCopy(m *discordgo.Message, localID, lang string, route Route) string {
+func (b *Bridge) updateLocalCopy(m *discordgo.Message, localID string, bridged Result, route Route) string {
 	if localID == "" {
-		return b.postLocalCopy(m, m.Content, lang, route)
+		return b.postLocalCopy(m, m.Content, bridged, route)
 	}
-	if !needsLocalCopy(m.Content, lang, route) {
+	need, lang := needsLocalCopy(m.Content, bridged, route)
+	if !need {
 		if err := b.s.ChannelMessageDelete(m.ChannelID, localID); err != nil {
 			recordError("удаление локального перевода %s: %v", localID, err)
 		}

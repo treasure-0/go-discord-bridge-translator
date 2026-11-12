@@ -38,6 +38,9 @@ var (
 type Result struct {
 	Text string
 	Lang string
+	// From LLM translators only (empty for machine translation):
+	Langs   []string // every language that makes up a meaningful part of the message
+	Trivial bool     // filler everyone understands: ok, gg, lol, xD, haha, hmm
 }
 
 // Translator translates a single chat message. hint is optional surrounding
@@ -157,15 +160,24 @@ func needsTranslation(s string) bool {
 // The point of an LLM here is to understand chat language that machine
 // translation misses: abbreviations, gaming/internet slang, memes and swearing.
 func llmPrompts(m masked, hint string, to Lang) (system, user string) {
-	system = "You are a translator for a gaming/community Discord server. Translate the user's chat message into " + to.Name + ". " +
-		"If the message is already in " + to.Name + ", return it unchanged. " +
+	// The strict rule is stated first and re-checked last: without it, smaller
+	// models return mixed messages ("Теперь должно работать what is the limit")
+	// unchanged because the dominant language already matches the target.
+	system = "STRICT RULE: every word of your translation must be in " + to.Name + ", except names, links, emoji and <x/> tags. " +
+		"Messages often mix languages (e.g. half English, half Russian): keep the parts already in " + to.Name +
+		" and translate ALL other parts into " + to.Name + ". " +
+		"You are a translator for a gaming/community Discord server. Translate the user's chat message into " + to.Name + ". " +
 		"Translate the meaning and intent, not word by word: the result must sound like a native speaker wrote it in chat. " +
 		"Understand abbreviations, internet and gaming slang, idioms, memes and typos (e.g. имхо, кек, лол, спс, норм, гг, афк, " +
 		"imo, tbh, ngl, gg, wp, afk, brb) and render them with natural equivalents in " + to.Name + ". " +
 		"Keep the tone and register; translate profanity with an equivalent of the same strength, never censor or soften it. " +
 		"Keep emoji, names and Discord markdown (**bold**, *italic*, ||spoiler||, > quotes, line breaks). " +
 		`Keep every <x i="N"/> tag exactly as written, in the matching position. ` +
-		`Respond with JSON only: {"lang": "<ISO 639-1 code of the original message's language, or \"und\" if unclear>", "translation": "<the translation>"}.`
+		`Respond with JSON only: {"lang": "<ISO 639-1 code of the main language of the original message, or \"und\" if unclear>", ` +
+		`"langs": [<ISO 639-1 codes of all languages that make up a meaningful part of the original; ignore names, single loanwords and universal chat words like ok, lol, gg>], ` +
+		`"trivial": <true if the whole message is filler everyone understands regardless of language, like ok, gg, lol, xD, haha, hmm, ty; otherwise false>, ` +
+		`"translation": "<the translation>"}. ` +
+		"Before answering, check: if any word of the translation is still in another language, translate it."
 	user = m.render(false)
 	if hint != "" {
 		user = "Earlier message, for context only (do not translate or output it):\n" + hint +
@@ -176,18 +188,55 @@ func llmPrompts(m masked, hint string, to Lang) (system, user string) {
 
 // parseLLM reads the {"lang","translation"} JSON reply. If the model ignored
 // the format, the whole reply is treated as the translation.
-func parseLLM(out string) (text, lang string) {
+func parseLLM(out string) Result {
 	s := strings.TrimSpace(out)
 	s = strings.TrimPrefix(strings.TrimPrefix(s, "```json"), "```")
 	s = strings.TrimSpace(strings.TrimSuffix(s, "```"))
 	var r struct {
-		Lang        string `json:"lang"`
-		Translation string `json:"translation"`
+		Lang        string   `json:"lang"`
+		Langs       []string `json:"langs"`
+		Trivial     bool     `json:"trivial"`
+		Translation string   `json:"translation"`
 	}
 	if err := json.Unmarshal([]byte(s), &r); err != nil || r.Translation == "" {
-		return strings.TrimSpace(out), ""
+		return Result{Text: strings.TrimSpace(out)}
 	}
-	return strings.TrimSpace(r.Translation), normLang(r.Lang)
+	res := Result{Text: strings.TrimSpace(r.Translation), Lang: normLang(r.Lang), Trivial: r.Trivial}
+	for _, l := range r.Langs {
+		if l = normLang(l); l != "" && l != "und" {
+			res.Langs = append(res.Langs, l)
+		}
+	}
+	return res
+}
+
+var (
+	latinWordRe    = regexp.MustCompile(`\b[A-Za-z]{2,}\b`)
+	cyrillicWordRe = regexp.MustCompile(`[А-Яа-яЁё]{2,}`)
+	// Chat words that stay as-is in any language.
+	universalWords = map[string]bool{"ok": true, "okay": true, "gg": true, "wp": true, "ggwp": true, "afk": true, "brb": true,
+		"lol": true, "lmao": true, "xd": true, "imo": true, "imho": true, "tbh": true, "ngl": true, "omg": true, "wtf": true,
+		"pls": true, "plz": true, "ty": true, "thx": true, "np": true, "gl": true, "hf": true, "glhf": true, "ez": true,
+		"op": true, "nerf": true, "buff": true, "pvp": true, "pve": true, "mmr": true, "mvp": true, "rip": true}
+)
+
+// leftoverWords finds words in the wrong script after translation (Latin in a
+// Russian translation, Cyrillic in an English one), ignoring placeholder tags and
+// universal chat words. Works for the RU/EN pair, whose scripts differ.
+func leftoverWords(text string, to Lang) []string {
+	clean := placeholderRe.ReplaceAllString(text, " ")
+	var found []string
+	switch to.ISO {
+	case "ru":
+		for _, w := range latinWordRe.FindAllString(clean, -1) {
+			if !universalWords[strings.ToLower(w)] {
+				found = append(found, w)
+			}
+		}
+	case "en":
+		found = cyrillicWordRe.FindAllString(clean, -1)
+	}
+	return found
 }
 
 // normLang turns "DE", "zh-Hans", "pt_BR" into "de", "zh", "pt".
@@ -254,8 +303,9 @@ func (g *Gemini) Translate(ctx context.Context, text, hint string, to Lang) (Res
 	if out == "" {
 		return Result{}, errors.New("gemini returned an empty response")
 	}
-	text2, lang := parseLLM(out)
-	return Result{Text: m.restore(text2, false), Lang: lang}, nil
+	res := parseLLM(out)
+	res.Text = m.restore(res.Text, false)
+	return res, nil
 }
 
 // ---------------------------------------------------------------------------

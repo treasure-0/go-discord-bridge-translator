@@ -156,7 +156,7 @@ func TestFallbackSkipsRateLimitedProvider(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		out, err := f.Translate(context.Background(), "x", "", LangEN)
 		if err != nil || out.Text != "ok" {
-			t.Fatalf("got %q %v", out, err)
+			t.Fatalf("got %+v %v", out, err)
 		}
 	}
 	if a.hits != 1 {
@@ -306,7 +306,7 @@ func TestAzureTranslateAndQuota(t *testing.T) {
 	a.endpoint = srv.URL
 	out, err := f.Translate(context.Background(), "привет <@1> https://x.y/?a=1&b=2", "", LangEN)
 	if err != nil || out.Text != "hello <@1> https://x.y/?a=1&b=2" || out.Lang != "ru" {
-		t.Fatalf("got %q %v", out, err)
+		t.Fatalf("got %+v %v", out, err)
 	}
 	if used, _, _ := a.Usage(context.Background()); gotRegion != "westeurope" || used == 0 {
 		t.Fatalf("region %q, usage %d", gotRegion, used)
@@ -344,7 +344,7 @@ func TestGroqTranslateAndRateLimit(t *testing.T) {
 	g.endpoint = srv.URL
 	out, err := g.Translate(context.Background(), "кек, имхо <@5>", "", LangEN)
 	if err != nil || out.Text != "lol, imo <@5>" || out.Lang != "ru" {
-		t.Fatalf("got %q %v", out, err)
+		t.Fatalf("got %+v %v", out, err)
 	}
 	if gotBody["response_format"] == nil || gotBody["reasoning_effort"] != "low" || !strings.Contains(gotBody["messages"].([]any)[0].(map[string]any)["content"].(string), "slang") {
 		t.Fatalf("request: %v", gotBody)
@@ -357,37 +357,43 @@ func TestGroqTranslateAndRateLimit(t *testing.T) {
 }
 
 func TestParseLLM(t *testing.T) {
-	cases := []struct{ in, text, lang string }{
-		{`{"lang":"DE","translation":"Hallo"}`, "Hallo", "de"},
-		{"```json\n{\"lang\":\"pt-BR\",\"translation\":\"oi\"}\n```", "oi", "pt"},
-		{"just text", "just text", ""},
+	r := parseLLM(`{"lang":"EN","langs":["en","RU"],"trivial":false,"translation":"Что если я вставлю русский"}`)
+	if r.Text != "Что если я вставлю русский" || r.Lang != "en" || len(r.Langs) != 2 || r.Langs[1] != "ru" || r.Trivial {
+		t.Fatalf("mixed: %+v", r)
 	}
-	for _, c := range cases {
-		if text, lang := parseLLM(c.in); text != c.text || lang != c.lang {
-			t.Errorf("parseLLM(%q) = %q %q", c.in, text, lang)
-		}
+	if r := parseLLM("```json\n{\"lang\":\"pt-BR\",\"translation\":\"oi\"}\n```"); r.Text != "oi" || r.Lang != "pt" {
+		t.Fatalf("fenced: %+v", r)
+	}
+	if r := parseLLM("just text"); r.Text != "just text" || r.Lang != "" {
+		t.Fatalf("plain: %+v", r)
 	}
 }
 
 func TestNeedsLocalCopy(t *testing.T) {
-	ru := Route{Target: "int", Lang: LangEN, Local: LangRU}
+	en := Route{Target: "ru", Lang: LangRU, Local: LangEN}
 	cases := []struct {
-		text, lang string
-		want       bool
+		name string
+		text string
+		res  Result
+		want bool
+		lang string
 	}{
-		{"Ich habe heute keine Zeit zum Spielen", "de", true},
-		{"I will be online later tonight", "en", true}, // neighbour's language is foreign here too
-		{"danke", "de", false},                         // too short
-		{"gg wp", "en", false},
-		{"привет всем, как дела у вас", "ru", false}, // local language
-		{"hmm what is this", "und", false},
-		{"", "", false},
+		{"mixed, English dominates", "One two Теперь должно работать", Result{Lang: "en", Langs: []string{"en", "ru"}}, true, "ru"},
+		{"short foreign phrase", "Hablas español", Result{Lang: "es", Langs: []string{"es"}}, true, "es"},
+		{"local language", "how many words do i need", Result{Lang: "en", Langs: []string{"en"}}, false, ""},
+		{"trivial filler", "gg wp", Result{Lang: "en", Langs: []string{"en"}, Trivial: true}, false, ""},
+		{"foreign but trivial", "danke", Result{Lang: "de", Langs: []string{"de"}, Trivial: true}, false, ""},
+		{"machine translation, foreign", "Parlez-vous français", Result{Lang: "fr"}, true, "fr"},
+		{"machine translation, one word", "danke", Result{Lang: "de"}, false, ""},
+		{"unknown", "hmm", Result{Lang: "und"}, false, ""},
 	}
 	for _, c := range cases {
-		if got := needsLocalCopy(c.text, c.lang, ru); got != c.want {
-			t.Errorf("needsLocalCopy(%q, %q) = %v, want %v", c.text, c.lang, got, c.want)
+		got, lang := needsLocalCopy(c.text, c.res, en)
+		if got != c.want || lang != c.lang {
+			t.Errorf("%s: got %v %q, want %v %q", c.name, got, lang, c.want, c.lang)
 		}
 	}
+	ru := Route{Target: "int", Lang: LangEN, Local: LangRU}
 	if got := localCopyText("de", ru, "Сегодня нет времени"); got != "🌐 **DE → RU:** Сегодня нет времени" {
 		t.Fatalf("localCopyText: %q", got)
 	}
@@ -445,5 +451,42 @@ func TestConnMonitorJournalsDisconnects(t *testing.T) {
 	}
 	if s := serverSnapshot(); !strings.Contains(s, "Память") {
 		t.Fatalf("snapshot: %q", s)
+	}
+}
+
+func TestLeftoverWords(t *testing.T) {
+	if got := leftoverWords(`Теперь должно работать: what is the limit <x i="0"/> gg`, LangRU); strings.Join(got, ",") != "what,is,the,limit" {
+		t.Fatalf("ru: %v", got)
+	}
+	if got := leftoverWords("Now it should work, кек", LangEN); len(got) != 1 || got[0] != "кек" {
+		t.Fatalf("en: %v", got)
+	}
+	if got := leftoverWords("Всё переведено, afk на 5 минут", LangRU); len(got) != 0 {
+		t.Fatalf("clean: %v", got)
+	}
+}
+
+func TestGroqRetriesLeftoverWords(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		tr := "Теперь должно работать: what is the limit"
+		if calls == 2 {
+			if n := len(body["messages"].([]any)); n != 4 {
+				t.Errorf("retry should include the previous answer and a correction, got %d messages", n)
+			}
+			tr = "Теперь должно работать: какой лимит?"
+		}
+		reply, _ := json.Marshal(map[string]any{"lang": "ru", "langs": []string{"ru", "en"}, "translation": tr})
+		json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]string{"content": string(reply)}}}})
+	}))
+	defer srv.Close()
+	g := NewGroq("k", "qwen/qwen3.8-27b")
+	g.endpoint = srv.URL
+	res, err := g.Translate(context.Background(), "Теперь должно работать what is the limit", "", LangRU)
+	if err != nil || res.Text != "Теперь должно работать: какой лимит?" || calls != 2 || len(res.Langs) != 2 {
+		t.Fatalf("got %+v %v calls=%d", res, err, calls)
 	}
 }
